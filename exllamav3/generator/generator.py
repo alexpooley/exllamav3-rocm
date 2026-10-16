@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
-from .kvpool import KVPool, SharedRecurrentCache, pool_config, _log as _kvpool_log
+from .kvpool import shared_tiers
 from .draft_confidence import DraftConfidenceCalibrator
 import os
 _presample_enable = os.environ.get("EXL3_PRESAMPLE", "1") != "0"
@@ -213,21 +213,14 @@ class Generator:
                 pin_memory = True
             )
 
-        # CPU page cache tier. With EXL3_KVPOOL set, a pool shared with the other processes on this host
-        # (kvpool.py) replaces the private tier; any failure falls back to the private tier
+        # CPU page cache tier. With EXL3_KVPOOL set, pools shared with the other processes on this host
+        # (kvpool.py) replace the private tiers; any failure falls back to them
         self.cpu_page_cache = None
         tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
-        pool_cfg = None if model.loaded_tp else pool_config()
-        pool_tag = "|".join(
-            str(getattr(getattr(m, "config", None), "directory", "")) for m in (model, draft_model)
-        )
-        if pool_cfg:
-            try:
-                self.cpu_page_cache = KVPool(tier_caches, pool_cfg[0], pool_cfg[1], tag = pool_tag)
-            except Exception as e:
-                _kvpool_log(f"shared KV pool unavailable, using private tier: {e!r}")
-                pool_cfg = None
-        if self.cpu_page_cache is None and cpu_cache_size:
+        shared = shared_tiers(model, draft_model, cache, tier_caches, recurrent_cache_size)
+        if shared:
+            self.cpu_page_cache = shared[0]
+        elif cpu_cache_size:
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
         if self.cpu_page_cache is not None:
             self.cpu_page_cache.attach(self.pagetable)
@@ -245,17 +238,9 @@ class Generator:
         # Recurrent cache
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
-            self.recurrent_cache = None
-            if pool_cfg:
-                # The shared pool holds the bulk; the private LRU only keeps recently used checkpoints
-                local = min(recurrent_cache_size, int(float(os.environ.get("EXL3_RCLOCAL_GB", "1")) * 1024**3))
-                try:
-                    self.recurrent_cache = SharedRecurrentCache(
-                        self.model, local, cache, pool_cfg[2], pool_cfg[3], tag = pool_tag
-                    )
-                except Exception as e:
-                    _kvpool_log(f"shared recurrent pool unavailable, using private cache: {e!r}")
-            if self.recurrent_cache is None:
+            if shared and shared[1] is not None:
+                self.recurrent_cache = shared[1]
+            else:
                 self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
             self.recurrent_cache.pagetable = self.pagetable
             # The new page table owns every page, so every state slot is ours too

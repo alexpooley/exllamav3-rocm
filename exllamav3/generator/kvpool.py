@@ -9,18 +9,18 @@ counts only the staging buffers, and a slot is never the source or target of an 
 cross-process rule is that slot contents and the table change under one flock.
 
 KVPool replaces CPUPageCache (same interface, plus fetch() may return None on a miss). SharedRecurrentCache
-extends RecurrentCache with the pool as a write-through second level.
+extends RecurrentCache with the pool as a write-through second level. shared_tiers() builds both.
 """
 
 import fcntl
 import hashlib
+import heapq
 import mmap
 import os
 import queue
 import struct
 import threading
 import time
-import heapq
 from collections import OrderedDict
 
 import numpy as np
@@ -30,11 +30,10 @@ from ..constants import PAGE_SIZE
 from ..cache.recurrent import RecurrentCache, note_freed
 
 MAGIC = 0x4C4F4F5056584B58  # "XKVPOOL" + version byte space
-VERSION = 1
+VERSION = 2
 HEADER_SIZE = 4096
-_HDR = struct.Struct("<QIIQ32sQQ")  # magic, version, n_slots, slot_size, fingerprint, gen, clock
-_GEN_OFF = 8 + 4 + 4 + 8 + 32
-_CLOCK_OFF = _GEN_OFF + 8
+_HDR = struct.Struct("<QIIQ32s")  # magic, version, n_slots, slot_size, fingerprint
+_CLOCK_OFF = _HDR.size            # u64 use counter, for last_use
 
 ST_EMPTY, ST_VALID = 0, 1
 SLOT_DTYPE = np.dtype([
@@ -44,11 +43,12 @@ SLOT_DTYPE = np.dtype([
     ("prev", "V16"),
     ("last_use", "<u8"),
     ("reserved_until", "<f8"),
-    ("aux", "<i8"),        # free per-pool field (recurrent: checkpoint position)
+    ("aux", "<i8"),        # KV: owner pid; recurrent: checkpoint position
 ])
 assert SLOT_DTYPE.itemsize == 64
 
 RAM_HEADROOM = 6 * 1024**3
+RC_LOCAL_SIZE = 1024**3   # private LRU of recently used checkpoints in front of the shared one
 
 
 def _align(n: int, a: int) -> int:
@@ -71,7 +71,8 @@ class SlotPool:
     """
     Fixed-size slots in a shared file, with a slot table in the file header. All state changes happen
     under an exclusive flock on the file, which the kernel releases if the holder dies. Readers copy slot
-    contents out while holding the lock, so a reader never sees a torn slot.
+    contents out while holding the lock, so a reader never sees a torn slot. Lookups outside the lock
+    (contains/prev_of) are hints; a fetch checks again under the lock.
     """
 
     def __init__(self, base: str, slot_size: int, max_size: int, fingerprint: bytes):
@@ -82,15 +83,11 @@ class SlotPool:
             fingerprint + struct.pack("<QQ", self.n_slots, self.slot_size), digest_size = 32
         ).digest()
         # The file name carries the fingerprint, so processes with a different model, cache layout or pool
-        # size never open the same file (resetting a file another process has mapped would crash it)
+        # size never open the same file
         self.path = path = f"{base}.{self.fingerprint[:6].hex()}.pool"
-        self.table_off = HEADER_SIZE
-        self.data_off = _align(self.table_off + self.n_slots * SLOT_DTYPE.itemsize, 4096)
+        self.data_off = _align(HEADER_SIZE + self.n_slots * SLOT_DTYPE.itemsize, 4096)
         self.total = self.data_off + self.n_slots * self.slot_size
         self.tlock = threading.Lock()  # flock is per open file, so threads of this process share it
-        self.depth = 0                 # nesting of locked() sections in the holding thread
-        self.owner = None
-        self.disabled = False
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok = True)
         # Lease: every process using the file holds a shared lock on <file>.lease for its lifetime, so stale
@@ -99,43 +96,29 @@ class SlotPool:
         fcntl.flock(self.lease_fd, fcntl.LOCK_SH)
         _remove_stale(base, keep = path)
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        with self._flock():
+        with self.locked():
             st = os.fstat(self.fd)
-            reuse = st.st_size == self.total and self._read_header_raw() == self._header_bytes()
+            reuse = st.st_size == self.total and os.pread(self.fd, _HDR.size, 0) == self._header()
             if not reuse:
                 self._check_space(st)
                 os.ftruncate(self.fd, 0)
                 os.ftruncate(self.fd, self.total)
             self.mm = mmap.mmap(self.fd, self.total, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
             self.buf = np.frombuffer(self.mm, dtype = np.uint8)
-            self.table = np.frombuffer(self.mm, dtype = SLOT_DTYPE, count = self.n_slots, offset = self.table_off)
-            self.gen = np.frombuffer(self.mm, dtype = "<u8", count = 2, offset = _GEN_OFF)  # [gen, clock]
+            self.table = np.frombuffer(self.mm, dtype = SLOT_DTYPE, count = self.n_slots, offset = HEADER_SIZE)
+            self.clock = np.frombuffer(self.mm, dtype = "<u8", count = 1, offset = _CLOCK_OFF)
             if not reuse:
-                self.mm[:HEADER_SIZE] = bytes(HEADER_SIZE)
-                self.table[:] = np.zeros(self.n_slots, dtype = SLOT_DTYPE)
-                self.mm[:_HDR.size] = self._header_bytes() + bytes(16)
+                self.mm[:_HDR.size] = self._header()
             n_valid = int((self.table["state"] == ST_VALID).sum())
         _log(f"{'reused' if reuse else 'created'} {path}: {self.n_slots} slots x "
              f"{self.slot_size / 1024**2:.1f} MiB, {n_valid} valid")
 
-        # Local mirror of the table: key -> (slot, prev_hash, aux). Refreshed when gen moves, rate limited
-        self._mirror = {}
-        self._mirror_gen = -1
-        self._mirror_time = 0.0
-        self.refresh(force = True)
-
-    # --- file and lock
-
-    def _header_bytes(self) -> bytes:
-        return _HDR.pack(MAGIC, VERSION, self.n_slots, self.slot_size, self.fingerprint, 0, 0)[:_GEN_OFF]
-
-    def _read_header_raw(self) -> bytes:
-        return os.pread(self.fd, _GEN_OFF, 0)
+    def _header(self) -> bytes:
+        return _HDR.pack(MAGIC, VERSION, self.n_slots, self.slot_size, self.fingerprint)
 
     def _check_space(self, st):
-        is_tmpfs = self.path.startswith("/dev/shm/")
         need = self.total - st.st_blocks * 512
-        if is_tmpfs:
+        if self.path.startswith("/dev/shm/"):
             avail = _mem_available()
             if avail - need < RAM_HEADROOM:
                 raise MemoryError(f"pool {self.path} needs {need / 1024**3:.1f} GB but only "
@@ -146,87 +129,40 @@ class SlotPool:
                 raise OSError(f"pool {self.path} needs {need / 1024**3:.1f} GB of free disk")
 
     class _Locked:
-        """Exclusive section: thread lock, then flock. Re-entrant in the holding thread; only the outermost
-        section takes and drops the flock."""
         def __init__(self, pool): self.pool = pool
         def __enter__(self):
-            p = self.pool
-            if p.depth and p.owner == threading.get_ident():
-                p.depth += 1
-                return p
-            p.tlock.acquire()
-            fcntl.flock(p.fd, fcntl.LOCK_EX)
-            p.owner = threading.get_ident()
-            p.depth = 1
-            return p
+            self.pool.tlock.acquire()
+            fcntl.flock(self.pool.fd, fcntl.LOCK_EX)
+            return self.pool
         def __exit__(self, *a):
-            p = self.pool
-            p.depth -= 1
-            if p.depth == 0:
-                p.owner = None
-                fcntl.flock(p.fd, fcntl.LOCK_UN)
-                p.tlock.release()
-
-    def _flock(self):
-        return SlotPool._Locked(self)
+            fcntl.flock(self.pool.fd, fcntl.LOCK_UN)
+            self.pool.tlock.release()
 
     def locked(self):
-        """Exclusive section. Verifies the header still matches (another process may have reset the pool for a
-        different model); on mismatch the pool disables itself and every later call is a miss."""
-        lk = self._flock()
-        lk.__enter__()
-        if not self.disabled and bytes(self.mm[:_GEN_OFF]) != self._header_bytes():
-            self.disabled = True
-            _log(f"{self.path} header changed under us; pool disabled for this process")
-        return lk
+        """Exclusive section: thread lock, then flock. Not re-entrant."""
+        return SlotPool._Locked(self)
 
-    def _bump(self):
-        self.gen[0] += 1
+    # --- slot access; find/contains/prev_of are safe without the lock as hints, the rest need it
 
-    def _tick(self) -> int:
-        self.gen[1] += 1
-        return int(self.gen[1])
+    def find(self, key: bytes) -> int | None:
+        t = self.table
+        idx = np.nonzero((t["key"] == np.void(key)) & (t["state"] == ST_VALID))[0]
+        return int(idx[0]) if len(idx) else None
 
-    # --- mirror
+    def prev_of(self, slot: int) -> bytes | None:
+        r = self.table[slot]
+        return r["prev"].tobytes() if r["has_prev"] else None
 
-    def refresh(self, force = False):
-        g = int(self.gen[0])
-        if not force and (g == self._mirror_gen or time.monotonic() - self._mirror_time < 0.05):
-            return
-        lk = self.locked()
-        try:
-            t = self.table.copy()
-            g = int(self.gen[0])
-        finally:
-            lk.__exit__()
-        m = {}
-        for i in np.nonzero(t["state"] == ST_VALID)[0]:
-            r = t[i]
-            m[r["key"].tobytes()] = (int(i), r["prev"].tobytes() if r["has_prev"] else None, int(r["aux"]))
-        self._mirror = m
-        self._mirror_gen = g
-        self._mirror_time = time.monotonic()
-
-    def mirror(self) -> dict:
-        self.refresh()
-        return self._mirror
-
-    # --- slot access, all under locked()
+    def count(self) -> int:
+        return int((self.table["state"] == ST_VALID).sum())
 
     def slot_view(self, slot: int) -> np.ndarray:
         o = self.data_off + slot * self.slot_size
         return self.buf[o : o + self.slot_size]
 
-    def find(self, key: bytes) -> int | None:
-        hit = self._mirror.get(key)
-        if hit is not None and self.table[hit[0]]["state"] == ST_VALID and \
-                self.table[hit[0]]["key"].tobytes() == key:
-            return hit[0]
-        idx = np.nonzero((self.table["state"] == ST_VALID) & (self.table["key"] == np.void(key)))[0]
-        return int(idx[0]) if len(idx) else None
-
     def touch(self, slot: int):
-        self.table["last_use"][slot] = self._tick()
+        self.clock[0] += 1
+        self.table["last_use"][slot] = self.clock[0]
 
     def reserve(self, slot: int, seconds: float):
         self.table["reserved_until"][slot] = time.time() + seconds
@@ -244,13 +180,11 @@ class SlotPool:
         for s, k in self._eviction_order(live):
             if first is None:
                 first = s
-            if self.table["reserved_until"][s] > now or (protect and k in protect):
-                continue
-            first = s
-            break
+            if self.table["reserved_until"][s] <= now and not (protect and k in protect):
+                first = s
+                break
         # (if everything is protected or reserved, the first candidate goes anyway)
-        self.table["state"][first] = ST_EMPTY
-        self._bump()
+        st[first] = ST_EMPTY
         return first, True
 
     def _eviction_order(self, live):
@@ -258,11 +192,10 @@ class SlotPool:
         recently used root first, each pruned tail-first, so a chain loses its newest pages before its prefix.
         A chain is orphaned when its parent is in neither the pool nor this process's GPU, and this process
         stored it (another card's GPU is not visible, so its pages count as rooted). Built fresh on each
-        eviction and consumed lazily: the table is shared, so a snapshot goes stale."""
+        eviction (~1 ms at 830 slots) and consumed lazily: the table is shared, so a snapshot goes stale."""
         t = self.table
         valid = np.nonzero(t["state"] == ST_VALID)[0].tolist()
-        keys, prevs, has_prev = t["key"], t["prev"], t["has_prev"]
-        aux, lu = t["aux"], t["last_use"]
+        keys, lu, aux = t["key"], t["last_use"], t["aux"]
         key = {i: keys[i].tobytes() for i in valid}
         by_key = {k: i for i, k in key.items()}
         parent = {}
@@ -270,7 +203,7 @@ class SlotPool:
         orphans, roots = [], []
         me = os.getpid()
         for i in valid:
-            pk = prevs[i].tobytes() if has_prev[i] else None
+            pk = self.prev_of(i)
             pi = by_key.get(pk) if pk is not None else None
             if pi is not None and pi != i:
                 parent[i] = pi
@@ -303,13 +236,11 @@ class SlotPool:
         r["has_prev"] = 1 if prev is not None else 0
         r["aux"] = aux
         r["reserved_until"] = 0.0
-        r["last_use"] = self._tick()
+        self.touch(slot)
         r["state"] = ST_VALID
-        self._bump()
-        self._mirror[key] = (slot, prev, aux)
 
     def close(self):
-        self.table = self.gen = self.buf = None
+        self.table = self.clock = self.buf = None
         try:
             self.mm.close()
         except BufferError:
@@ -344,16 +275,33 @@ def _remove_stale(base: str, keep: str):
         _log(f"removed stale pool {p}")
 
 
+class _Entries:
+    """The part of CPUPageCache.entries that PageTable reads: entries[h]["prev_hash"]."""
+    def __init__(self, pool): self.pool = pool
+    def __getitem__(self, h):
+        s = self.pool.find(h)
+        if s is None:
+            raise KeyError(h)
+        return {"slot": s, "prev_hash": self.pool.prev_of(s)}
+    def __contains__(self, h): return self.pool.find(h) is not None
+    def __len__(self): return self.pool.count()
+
+
 class KVPool:
     """
     Drop-in for CPUPageCache backed by a SlotPool shared between processes. A page image is the token IDs
     followed by the page's slice of every paged tensor of the attached caches (main and draft).
 
     store(): D2H into a pinned staging slot on the current stream; a worker thread waits for the copy, then
-    writes the pool slot under the lock and publishes it. Until then the page is "pending" and is restored
-    from staging directly. fetch(): copies pool -> staging under the lock (synchronous), then H2D on the
-    current stream. Returns None if the page is gone, which the patched PageTable treats as a miss.
+    writes the pool slot under the lock and publishes it. fetch(): waits for a pending store of the same page,
+    copies pool -> staging under the lock, then H2D on the current stream. Returns None if the page is gone,
+    which the patched PageTable treats as a miss.
+
+    write_through: job.py also pushes each page once it is complete and final, not only on eviction, so the
+    other card finds a conversation that is still live here.
     """
+
+    write_through = True
 
     def __init__(self, caches: list, path: str, max_size: int, staging_size: int = 256 * 1024**2,
                  tag: str = ""):
@@ -376,11 +324,9 @@ class KVPool:
         self.image_size = _align(offset, 4096)
         self.pool = SlotPool(path, self.image_size, max_size, "|".join(desc).encode())
         self.max_slots = self.pool.n_slots
+        self.entries = _Entries(self.pool)
         self.pagetable = None
 
-        # Write-through: job.py also pushes each page once it is complete and final, not only on eviction,
-        # so the other card finds a conversation that is still live here. EXL3_KVPOOL_WT=0 turns it off
-        self.write_through = os.environ.get("EXL3_KVPOOL_WT", "1") != "0"
         n_stage = max(4, staging_size // self.image_size)
         self.stage = torch.empty((n_stage, self.image_size), dtype = torch.uint8, pin_memory = True)
         self.stage_np = self.stage.numpy()
@@ -388,13 +334,9 @@ class KVPool:
         self.stage_read_ev = [None] * n_stage   # event of the last H2D reading the slot
         self.stage_cond = threading.Condition()
 
-        self.pending = {}   # phash -> (stage_idx, prev_hash, tokens)
+        self.pending = set()   # page hashes queued for the worker
         self.queue = queue.Queue()
-        self.metrics = {
-            "pushes": 0, "dedup_hits": 0, "restores": 0, "evictions": 0, "cold_allocs": 0,
-            "fetch_misses": 0, "restores_pending": 0,
-        }
-        self._stop = False
+        self.metrics = {"pushes": 0, "dedup_hits": 0, "restores": 0, "evictions": 0, "fetch_misses": 0}
         self._worker = threading.Thread(target = self._work, daemon = True, name = "kvpool")
         self._worker.start()
 
@@ -408,17 +350,10 @@ class KVPool:
         return pt is not None and pt.get_live_page(phash) is not None
 
     def __contains__(self, phash: bytes):
-        return phash in self.pending or (not self.pool.disabled and phash in self.pool.mirror())
+        return phash in self.pending or self.pool.find(phash) is not None
 
     def __len__(self):
-        return len(self.pool.mirror()) + len(self.pending)
-
-    @property
-    def entries(self):
-        m = {h: {"slot": s, "prev_hash": p} for h, (s, p, _) in self.pool.mirror().items()}
-        for h, (_, p, _) in list(self.pending.items()):
-            m[h] = {"slot": -1, "prev_hash": p}
-        return m
+        return self.pool.count() + len(self.pending)
 
     # --- staging
 
@@ -434,13 +369,10 @@ class KVPool:
         return i
 
     def _give_stage(self, i: int, read_ev = None):
-        # Called with the slot exclusively ours. A pending-restore H2D may have set stage_read_ev[i] while the
-        # slot held a pending store; that event is kept unless this caller has a newer one
         with self.stage_cond:
-            if read_ev is not None:
-                self.stage_read_ev[i] = read_ev
+            self.stage_read_ev[i] = read_ev
             self.stage_free.append(i)
-            self.stage_cond.notify()
+            self.stage_cond.notify_all()
 
     def _views(self, buf: torch.Tensor):
         for t, off, nbytes, shape, dtype in self.segments:
@@ -453,26 +385,23 @@ class KVPool:
         if h in self.pending:
             self.metrics["dedup_hits"] += 1
             return
-        if h in self.pool.mirror():
-            lk = self.pool.locked()
-            try:
+        if self.pool.find(h) is not None:
+            with self.pool.locked():
                 s = self.pool.find(h)
                 if s is not None:
                     self.pool.touch(s)
-            finally:
-                lk.__exit__()
             if s is not None:
                 self.metrics["dedup_hits"] += 1
                 return
         i = self._take_stage()
         buf = self.stage[i]
-        tokens = page.sequence.reshape(-1).to(torch.long).clone()
+        tokens = page.sequence.reshape(-1).to(torch.long)
         buf[: PAGE_SIZE * 8].copy_(tokens.view(torch.uint8))
         for t, v in self._views(buf):
             v.copy_(t[page.page_index], non_blocking = True)
         ev = torch.cuda.Event()
         ev.record()
-        self.pending[h] = (i, page.prev_hash, tokens)
+        self.pending.add(h)
         self.queue.put((h, i, ev, page.prev_hash, set(protect) if protect else None))
         self.metrics["pushes"] += 1
 
@@ -484,58 +413,36 @@ class KVPool:
             h, i, ev, prev, protect = item
             try:
                 ev.synchronize()
-                lk = self.pool.locked()
-                try:
-                    if not self.pool.disabled and self.pool.find(h) is None:
+                with self.pool.locked():
+                    if self.pool.find(h) is None:
                         s, evicted = self.pool.claim(protect, self._live)
                         self.pool.slot_view(s)[: self.image_size] = self.stage_np[i]
                         self.pool.publish(s, h, prev, aux = os.getpid())
-                        if evicted:
-                            self.metrics["evictions"] += 1
-                finally:
-                    lk.__exit__()
+                        self.metrics["evictions"] += evicted
             except Exception as e:
                 _log(f"store failed: {e!r}")
             finally:
-                # Drop the pending entry and free the slot atomically with respect to a pending-restore, so a
-                # restore either sees the entry (and records its event first) or goes to the pool
                 with self.stage_cond:
-                    self.pending.pop(h, None)
+                    self.pending.discard(h)
+                    self.stage_read_ev[i] = None
                     self.stage_free.append(i)
-                    self.stage_cond.notify()
+                    self.stage_cond.notify_all()
 
     # --- fetch
 
     def fetch(self, phash: bytes, page_index: int, serial: int) -> dict | None:
         with self.stage_cond:
-            p = self.pending.get(phash)
-            if p is not None:
-                i, prev, tokens = p
-                for t, v in self._views(self.stage[i]):
-                    t[page_index].copy_(v, non_blocking = True)
-                ev = torch.cuda.Event()
-                ev.record()
-                self.stage_read_ev[i] = ev
-        if p is not None:
-            self.metrics["restores"] += 1
-            self.metrics["restores_pending"] += 1
-            return {"tokens": tokens.view(1, -1), "prev_hash": prev}
-
-        if self.pool.disabled:
-            return None
+            while phash in self.pending:   # rare: a page stored moments ago; wait until it is in the pool
+                self.stage_cond.wait()
         i = self._take_stage()
-        ok = False
+        ev = None
         try:
-            lk = self.pool.locked()
-            try:
-                s = None if self.pool.disabled else self.pool.find(phash)
+            with self.pool.locked():
+                s = self.pool.find(phash)
                 if s is not None:
                     self.stage_np[i] = self.pool.slot_view(s)[: self.image_size]
-                    r = self.pool.table[s]
-                    prev = r["prev"].tobytes() if r["has_prev"] else None
+                    prev = self.pool.prev_of(s)
                     self.pool.touch(s)
-            finally:
-                lk.__exit__()
             if s is None:
                 self.metrics["fetch_misses"] += 1
                 return None
@@ -550,16 +457,16 @@ class KVPool:
                 t[page_index].copy_(v, non_blocking = True)
             ev = torch.cuda.Event()
             ev.record()
-            ok = True
             self.metrics["restores"] += 1
             return {"tokens": tokens.view(1, -1), "prev_hash": prev}
         finally:
-            self._give_stage(i, ev if ok else None)
+            self._give_stage(i, ev)
 
     def flush(self):
         """Wait until every pending store is in the pool (tests, shutdown)."""
-        while self.pending:
-            time.sleep(0.001)
+        with self.stage_cond:
+            while self.pending:
+                self.stage_cond.wait()
 
     def close(self):
         self.flush()
@@ -595,8 +502,8 @@ class SharedRecurrentCache(RecurrentCache):
     """
     RecurrentCache (a small local LRU of stashed states) with a shared SlotPool as a write-through second
     level. put() writes new checkpoints to the pool; get() reports checkpoints that exist only in the pool
-    (and reserves them so another process cannot evict them before the matching get_stashed()); get_stashed()
-    loads them into fresh local tensors.
+    and reserves them, because PageTable asserts that get_stashed() finds what get() reported, and another
+    process could evict it in between; get_stashed() loads them into fresh local tensors.
     """
 
     RESERVE_SECONDS = 60.0
@@ -624,13 +531,10 @@ class SharedRecurrentCache(RecurrentCache):
 
     def put(self, key, state):
         super().put(key, state)
-        if self.pool.disabled or not self._local_has(key):
+        if not self._local_has(key):
             return
         stashed = OrderedDict.__getitem__(self, key)
-        lk = self.pool.locked()
-        try:
-            if self.pool.disabled:
-                return
+        with self.pool.locked():
             s = self.pool.find(key)
             if s is not None:
                 self.pool.touch(s)
@@ -643,32 +547,27 @@ class SharedRecurrentCache(RecurrentCache):
                                       dtype = np.uint8)
             self.pool.publish(s, key, None, aux = stashed["position"])
             self.metrics["pool_puts"] += 1
-        finally:
-            lk.__exit__()
 
     def get(self, key, default = None):
         v = OrderedDict.get(self, key)
         if v is not None:
             return v
-        if self.pool.disabled or key not in self.pool.mirror():
+        if self.pool.find(key) is None:
             return default
-        lk = self.pool.locked()
-        try:
+        with self.pool.locked():
             s = self.pool.find(key)
             if s is not None:
                 self.pool.reserve(s, self.RESERVE_SECONDS)
-        finally:
-            lk.__exit__()
         return {"shared": True} if s is not None else default
 
     def get_stashed(self, key, default = None):
         if self._local_has(key):
             return super().get_stashed(key, default)
-        if self.pool.disabled or key not in self.pool.mirror():
+        if self.pool.find(key) is None:
+            self.metrics["pool_misses"] += 1
             return default
         tensors = [torch.empty(shape, dtype = dtype) for (_, _, _, _, shape, dtype) in self.layout]
-        lk = self.pool.locked()
-        try:
+        with self.pool.locked():
             s = self.pool.find(key)
             if s is not None:
                 view = self.pool.slot_view(s)
@@ -677,8 +576,6 @@ class SharedRecurrentCache(RecurrentCache):
                 position, size = struct.unpack("<qq", bytes(view[:16]))
                 self.pool.touch(s)
                 self.pool.table["reserved_until"][s] = 0.0
-        finally:
-            lk.__exit__()
         if s is None:
             self.metrics["pool_misses"] += 1
             return default
@@ -708,10 +605,27 @@ class SharedRecurrentCache(RecurrentCache):
         self.pool.close()
 
 
-def pool_config():
-    """(kv_path, kv_bytes, rc_path, rc_bytes) from the environment, or None when the pool is off."""
+def shared_tiers(model, draft_model, cache, tier_caches: list, recurrent_cache_size: int):
+    """
+    (KVPool, SharedRecurrentCache or None) when EXL3_KVPOOL names a pool base path, else None. Sizes come from
+    EXL3_KVPOOL_GB (default 8) and EXL3_RCPOOL_GB (default 4). Any failure returns None, so the generator falls
+    back to its private tiers.
+    """
     base = os.environ.get("EXL3_KVPOOL")
-    if not base:
+    if not base or model.loaded_tp:
         return None
     gb = lambda n, d: int(float(os.environ.get(n, d)) * 1024**3)
-    return base + ".kv", gb("EXL3_KVPOOL_GB", 8), base + ".rc", gb("EXL3_RCPOOL_GB", 4)
+    tag = "|".join(str(getattr(getattr(m, "config", None), "directory", "")) for m in (model, draft_model))
+    kv = None
+    try:
+        kv = KVPool(tier_caches, base + ".kv", gb("EXL3_KVPOOL_GB", 8), tag = tag)
+        rc = None
+        if model.caps.get("recurrent_states"):
+            rc = SharedRecurrentCache(model, min(recurrent_cache_size, RC_LOCAL_SIZE), cache,
+                                      base + ".rc", gb("EXL3_RCPOOL_GB", 4), tag = tag)
+        return kv, rc
+    except Exception as e:
+        _log(f"shared pool unavailable, using private tiers: {e!r}")
+        if kv is not None:
+            kv.close()
+        return None

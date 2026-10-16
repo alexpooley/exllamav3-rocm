@@ -137,7 +137,7 @@ def role_hold_lock(pool_mb):
     from exllamav3.generator.kvpool import KVPool
     init_hip()
     tier = KVPool([FakeCache()], BASE + ".kv", pool_mb << 20, staging_size = 8 << 20, tag = "test")
-    tier.pool.locked()
+    tier.pool.locked().__enter__()
     print("LOCKED", flush = True)
     time.sleep(600)
 
@@ -145,7 +145,8 @@ def role_try_lock(pool_mb):
     from exllamav3.generator.kvpool import KVPool
     init_hip()
     tier = KVPool([FakeCache()], BASE + ".kv", pool_mb << 20, staging_size = 8 << 20, tag = "test")
-    lk = tier.pool.locked(); lk.__exit__()
+    with tier.pool.locked():
+        pass
     print("GOT LOCK", flush = True)
     tier.close()
 
