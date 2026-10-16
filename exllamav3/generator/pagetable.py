@@ -590,9 +590,11 @@ class PageTable:
                     if (
                         self.cpu_tier is not None and
                         (restore_limit is None or lp < restore_limit) and
-                        h in self.cpu_tier
+                        h in self.cpu_tier and
+                        # A shared tier (kvpool) returns None when another process evicted the page since
+                        # the lookup; the page then falls through to prefill like any other miss
+                        (entry := self.cpu_tier.fetch(h, op.page_index, self.access_serial)) is not None
                     ):
-                        entry = self.cpu_tier.fetch(h, op.page_index, self.access_serial)
                         op.sequence.copy_(entry["tokens"])
                         op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
                         op.kv_position = PAGE_SIZE
