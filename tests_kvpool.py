@@ -27,6 +27,11 @@ class FakeCache:
         self.model = None
         self.layers = {0: FakeLayer(n, dev), 1: FakeLayer(n, dev)}
 
+class FakePageTable:
+    """No page is live on the GPU, so a stored page whose parent is gone is an orphan."""
+    def get_live_page(self, phash):
+        return None
+
 class FakePage:
     def __init__(self, seq, prev, page_index):
         from exllamav3.generator.pagetable import tensor_hash_checksum
@@ -84,6 +89,7 @@ def role_store(pool_mb, chain, n, done_flag):
     init_hip()
     cache = FakeCache()
     tier = KVPool([cache], BASE + ".kv", pool_mb << 20, staging_size = 8 << 20, tag = "test")
+    tier.attach(FakePageTable())
     for k, p in enumerate(chain_pages(chain, n)):
         p.page_index = k % N_PAGES_GPU
         fill_gpu(cache, p.page_index, p.phash)
@@ -96,13 +102,14 @@ def role_store(pool_mb, chain, n, done_flag):
     tier.close()
 
 def role_fetch(pool_mb, chain, n, expect):
-    """expect: 'all' every page restores; 'tail:K' only the last K restore."""
+    """expect: 'all' every page restores; 'head:K' K pages restore, the chain head among them."""
     from exllamav3.generator.kvpool import KVPool
     init_hip()
     cache = FakeCache()
     tier = KVPool([cache], BASE + ".kv", pool_mb << 20, staging_size = 8 << 20, tag = "test")
     pages = chain_pages(chain, n)
     ok = bad = miss = 0
+    head_ok = False
     for k, p in enumerate(pages):
         dst = (k * 7 + 3) % N_PAGES_GPU
         present = p.phash in tier
@@ -115,6 +122,7 @@ def role_fetch(pool_mb, chain, n, expect):
             and e["prev_hash"] == p.prev_hash
         ok += good
         bad += not good
+        head_ok |= good and k == 0
     # is_resumable-style chain walk through entries
     entries = tier.entries
     print(f"FETCH ok={ok} bad={bad} miss={miss} entries={len(entries)}", tier.metrics, flush = True)
@@ -122,7 +130,7 @@ def role_fetch(pool_mb, chain, n, expect):
         assert ok == n and bad == 0, "not every page restored correctly"
     else:
         k = int(expect.split(":")[1])
-        assert bad == 0 and ok == k and miss == n - k, f"expected only the last {k} pages"
+        assert bad == 0 and ok == k and miss == n - k and head_ok, f"expected {k} pages including the head"
     tier.close()
 
 def role_hold_lock(pool_mb):
@@ -242,7 +250,7 @@ def role_rc(mode, n):
 # ---------------------------------------------------------------- orchestration
 
 def run(card, *args, wait = True, timeout = 300):
-    env = dict(os.environ, ROCR_VISIBLE_DEVICES = str(card), EXL3_EXPANDABLE_SEGMENTS = "0")
+    env = dict(os.environ, ROCR_VISIBLE_DEVICES = str(card))
     p = subprocess.Popen([PY, ME, "_role", *map(str, args)], env = env, stdout = subprocess.PIPE,
                          stderr = subprocess.STDOUT, text = True)
     if not wait:
@@ -271,18 +279,18 @@ def main():
     rc2, out2 = run(0, "fetch", 64, 2, 40, "all")
     results.append(check("card1 store -> card0 fetch, 40 pages exact", rc == 0 and rc2 == 0, out + out2))
 
-    # 2. LRU: a pool of ~16 slots keeps only the newest pages of a longer chain; misses are clean
+    # 2. Eviction: a pool of ~16 slots holding a longer chain prunes tail-first, so the head stays; misses are clean
     fresh()
     slots_mb = 4   # 16 slots of ~256 KiB
     rc, out = run(0, "store", slots_mb, 3, 40, BASE + ".done3")
     import re
     m = re.search(r"'evictions': (\d+)", out)
-    rc2, out2 = run(1, "fetch", slots_mb, 3, 40, f"tail:{40 - int(m.group(1))}" if m else "tail:0")
-    results.append(check("LRU eviction keeps the newest pages, misses return None", rc == 0 and rc2 == 0,
+    rc2, out2 = run(1, "fetch", slots_mb, 3, 40, f"head:{40 - int(m.group(1))}" if m else "head:0")
+    results.append(check("tail-first eviction keeps the chain head, misses return None", rc == 0 and rc2 == 0,
                          out + out2))
 
     # 3. pool survives the writer exiting; a restart reuses the file
-    rc2, out2 = run(0, "fetch", slots_mb, 3, 40, f"tail:{40 - int(m.group(1))}" if m else "tail:0")
+    rc2, out2 = run(0, "fetch", slots_mb, 3, 40, f"head:{40 - int(m.group(1))}" if m else "head:0")
     results.append(check("pool survives writer exit and is reused on reopen", rc2 == 0 and "reused" in out2, out2))
 
     # 4. a process killed while holding the lock does not block the other

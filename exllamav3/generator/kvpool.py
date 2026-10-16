@@ -20,6 +20,7 @@ import queue
 import struct
 import threading
 import time
+import heapq
 from collections import OrderedDict
 
 import numpy as np
@@ -68,7 +69,7 @@ def _log(msg: str):
 
 class SlotPool:
     """
-    Fixed-size slots in a shared file, with an LRU slot table in the file header. All state changes happen
+    Fixed-size slots in a shared file, with a slot table in the file header. All state changes happen
     under an exclusive flock on the file, which the kernel releases if the holder dies. Readers copy slot
     contents out while holding the lock, so a reader never sees a torn slot.
     """
@@ -230,28 +231,70 @@ class SlotPool:
     def reserve(self, slot: int, seconds: float):
         self.table["reserved_until"][slot] = time.time() + seconds
 
-    def claim(self, protect: set | None) -> tuple[int, bool]:
-        """Slot to overwrite: an empty one, else the least recently used valid slot that is neither protected
-        by the caller nor reserved by another process. Marks it empty. Returns (slot, evicted)."""
+    def claim(self, protect: set | None, live = None) -> tuple[int, bool]:
+        """Slot to overwrite: an empty one, else the first valid slot in eviction order (see _eviction_order)
+        that is neither protected by the caller nor reserved by another process. Marks it empty.
+        live(key) -> bool tells if a page is live in this process's GPU page table. Returns (slot, evicted)."""
         st = self.table["state"]
         empty = np.nonzero(st != ST_VALID)[0]
         if len(empty):
             return int(empty[0]), False
-        lu = self.table["last_use"].astype(np.float64)
         now = time.time()
-        bad = self.table["reserved_until"] > now
-        if protect:
-            keys = self.table["key"]
-            for i in range(self.n_slots):
-                if keys[i].tobytes() in protect:
-                    bad[i] = True
-        if bad.all():
-            bad[:] = False
-        lu[bad] = np.inf
-        s = int(np.argmin(lu))
-        self.table["state"][s] = ST_EMPTY
+        first = None
+        for s, k in self._eviction_order(live):
+            if first is None:
+                first = s
+            if self.table["reserved_until"][s] > now or (protect and k in protect):
+                continue
+            first = s
+            break
+        # (if everything is protected or reserved, the first candidate goes anyway)
+        self.table["state"][first] = ST_EMPTY
         self._bump()
-        return s, True
+        return first, True
+
+    def _eviction_order(self, live):
+        """Valid slots in eviction order, as in CPUPageCache: orphaned chains first, then whole trees, least
+        recently used root first, each pruned tail-first, so a chain loses its newest pages before its prefix.
+        A chain is orphaned when its parent is in neither the pool nor this process's GPU, and this process
+        stored it (another card's GPU is not visible, so its pages count as rooted). Built fresh on each
+        eviction and consumed lazily: the table is shared, so a snapshot goes stale."""
+        t = self.table
+        valid = np.nonzero(t["state"] == ST_VALID)[0].tolist()
+        keys, prevs, has_prev = t["key"], t["prev"], t["has_prev"]
+        aux, lu = t["aux"], t["last_use"]
+        key = {i: keys[i].tobytes() for i in valid}
+        by_key = {k: i for i, k in key.items()}
+        parent = {}
+        children = {i: [] for i in valid}
+        orphans, roots = [], []
+        me = os.getpid()
+        for i in valid:
+            pk = prevs[i].tobytes() if has_prev[i] else None
+            pi = by_key.get(pk) if pk is not None else None
+            if pi is not None and pi != i:
+                parent[i] = pi
+                children[pi].append(i)
+            elif pk is not None and int(aux[i]) == me and live is not None and not live(pk):
+                orphans.append(i)
+            else:
+                roots.append(i)
+        for root in sorted(orphans, key = lambda i: int(lu[i])) + sorted(roots, key = lambda i: int(lu[i])):
+            remaining, heap, stack = {}, [], [root]
+            while stack:
+                i = stack.pop()
+                remaining[i] = len(children[i])
+                if not children[i]:
+                    heapq.heappush(heap, (int(lu[i]), i))
+                stack.extend(children[i])
+            while heap:
+                _, i = heapq.heappop(heap)
+                yield i, key[i]
+                pi = parent.get(i)
+                if pi is not None and pi in remaining:
+                    remaining[pi] -= 1
+                    if remaining[pi] == 0:
+                        heapq.heappush(heap, (int(lu[pi]), pi))
 
     def publish(self, slot: int, key: bytes, prev: bytes | None, aux: int = 0):
         r = self.table[slot:slot + 1]
@@ -357,6 +400,10 @@ class KVPool:
     def attach(self, pagetable):
         self.pagetable = pagetable
 
+    def _live(self, phash: bytes) -> bool:
+        pt = self.pagetable
+        return pt is not None and pt.get_live_page(phash) is not None
+
     def __contains__(self, phash: bytes):
         return phash in self.pending or (not self.pool.disabled and phash in self.pool.mirror())
 
@@ -437,9 +484,9 @@ class KVPool:
                 lk = self.pool.locked()
                 try:
                     if not self.pool.disabled and self.pool.find(h) is None:
-                        s, evicted = self.pool.claim(protect)
+                        s, evicted = self.pool.claim(protect, self._live)
                         self.pool.slot_view(s)[: self.image_size] = self.stage_np[i]
-                        self.pool.publish(s, h, prev)
+                        self.pool.publish(s, h, prev, aux = os.getpid())
                         if evicted:
                             self.metrics["evictions"] += 1
                 finally:
