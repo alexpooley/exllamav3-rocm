@@ -378,6 +378,9 @@ class KVPool:
         self.max_slots = self.pool.n_slots
         self.pagetable = None
 
+        # Write-through: job.py also pushes each page once it is complete and final, not only on eviction,
+        # so the other card finds a conversation that is still live here. EXL3_KVPOOL_WT=0 turns it off
+        self.write_through = os.environ.get("EXL3_KVPOOL_WT", "1") != "0"
         n_stage = max(4, staging_size // self.image_size)
         self.stage = torch.empty((n_stage, self.image_size), dtype = torch.uint8, pin_memory = True)
         self.stage_np = self.stage.numpy()

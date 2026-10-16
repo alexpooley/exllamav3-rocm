@@ -5,7 +5,7 @@ if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import Sequence, tensor_hash_checksum, random_hash
+from .pagetable import Sequence, tensor_hash_checksum, random_hash, is_content_hash
 from .filter import Filter
 import random
 import time
@@ -711,6 +711,11 @@ class Job:
                     # Update the hash
                     page.update_hash(new_hash)
 
+                # Write-through (ADR 0058): page N-1 is final once page N completes (no rollback reaches it and
+                # its draft-cache rows are written), so the shared tier gets it while it is still live here
+                if page_before > 0:
+                    self._write_through(seq.allocated_pages[page_before - 1])
+
                 # Allow completing the final page without starting a new one (for requeue)
                 if page_after < len(seq.allocated_pages):
                     page = seq.allocated_pages[page_after]
@@ -1234,6 +1239,14 @@ class Job:
         return new_pages
 
 
+    def _write_through(self, page):
+        """Push a complete, final page to a write-through CPU tier (the shared kvpool), so another process
+        can restore it while it is still live in this GPU cache. Private tiers only take pages on eviction."""
+        tier = self.pagetable.cpu_tier
+        if tier is not None and getattr(tier, "write_through", False) and \
+                page.kv_position == PAGE_SIZE and is_content_hash(page.phash):
+            tier.store(page, self.pagetable.access_serial)
+
     def prefill(self, results: list):
         """
         Run prompt prefill chunks for already allocated cache pages.
@@ -1490,6 +1503,8 @@ class Job:
                     if pfp_b > pfp_a:
                         page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
                     page.can_revert = False
+                for local_idx in range(p0, p2):
+                    self._write_through(seq.allocated_pages[local_idx])
 
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
