@@ -201,6 +201,32 @@ verification from ~45 ms to ~14 ms per round.
   (`rms_norm_res_in`, already used between attention and MLP), removing ~58 elementwise kernels per
   round.
 
+### Shared KV pool across GPUs: `generator/kvpool.py`
+
+One process per GPU (for example one TabbyAPI per card behind a router) normally means one private CPU
+page cache per process. A conversation evicted on one card, or a turn that the router sends to the other
+card, is then a full prefill again.
+
+With `EXL3_KVPOOL` set, every generator process on the host maps one shared pool file (tmpfs or disk)
+instead. The pool replaces the private `CPUPageCache` and also holds the recurrent-state checkpoints.
+
+- Pages go to the pool when a card evicts them, and also write-through as they complete (prefill pages
+  after each chunk, decode pages one page late, once no rollback can reach them). A conversation that is
+  still live on one card can therefore continue on the other.
+- The pool memory is never registered with HIP. GPU transfers use a small pinned staging buffer per
+  process, and the CPU copies between staging and the pool. KFD counts only the staging buffers, and no
+  slot is ever the source or target of a DMA in flight. The one cross-process rule is that slot contents
+  and the slot table change under one `flock`.
+- Eviction is tail-first with orphans first, the same order as `CPUPageCache`. Plain LRU evicts the head
+  of a page chain and makes the rest of the chain useless.
+- The file name carries a fingerprint of the model, draft model and cache layout, so a different model
+  never opens the same pool.
+- Any error at start falls back to the private tiers.
+
+Measured on 2x RX 7900 XTX with Qwen3.8-27B EXL3 + DFlash2: a 40K-token prompt cached on one card restores
+on the other in 1.7-3.1 s, against 39 s cold, with the same greedy output. `tests_kvpool.py` runs model-free
+tests with worker processes on both cards.
+
 ## Environment switches
 
 | Variable | Default | Effect |
@@ -217,6 +243,9 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_RESID_DEFER` | 1 | 0 = no residual-add folding into the next block's input norm |
 | `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `attn`) that decode eagerly instead of through a HIP graph |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
+| `EXL3_KVPOOL` | - | base path of the shared KV pool (for example `/dev/shm/exl3-kv`); unset = private CPU cache |
+| `EXL3_KVPOOL_GB` | 8 | shared KV page pool size |
+| `EXL3_RCPOOL_GB` | 4 | shared recurrent-checkpoint pool size |
 
 ## Tests and benchmarks (`rocm_tests/`)
 
