@@ -257,6 +257,15 @@ Two more TabbyAPI notes:
 - `sampler-qwen38.yml`: Qwen3.8 model-card sampling (temperature 1.0, top_k 20, top_p 0.95, min_p 0.05),
   used when a request sends no sampling. Without a preset TabbyAPI runs top_k 0 / min_p 0.
 
+**Other GPUs.** `kvpool.py` has no ROCm-specific code. It uses only standard PyTorch GPU calls and builds
+on upstream exllamav3's `CPUPageCache` and `RecurrentCache`, so it should also work with upstream exllamav3
+on NVIDIA. That is untested. To use it there, copy `exllamav3/generator/kvpool.py` and the hooks in
+`generator.py`, `job.py` and `pagetable.py` (see the `kvpool:` commits on this branch) onto upstream
+exllamav3. This fork is based on upstream commit `6b84a21`. Then run one process per GPU with
+`CUDA_VISIBLE_DEVICES` and set the same `EXL3_KVPOOL` path for all of them. For `tests_kvpool.py`, change
+`ROCR_VISIBLE_DEVICES` to `CUDA_VISIBLE_DEVICES`. The two-card config and launcher in `rocm/` are tuned for
+24 GB RX 7900 XTX cards and need new context and memory values for other GPUs.
+
 ## Environment switches
 
 | Variable | Default | Effect |
