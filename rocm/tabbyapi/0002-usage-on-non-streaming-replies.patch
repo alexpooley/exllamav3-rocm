@@ -1,0 +1,13 @@
+diff --git a/endpoints/OAI/utils/chat_completion.py b/endpoints/OAI/utils/chat_completion.py
+index 5c2b350..d734189 100644
+--- a/endpoints/OAI/utils/chat_completion.py
++++ b/endpoints/OAI/utils/chat_completion.py
+@@ -929,7 +929,7 @@ async def generate_chat_completion(
+     disconnect_handler: DisconnectHandler,
+ ):
+     gen_tasks: List[asyncio.Task] = []
+-    return_usage = data.stream_options and data.stream_options.include_usage
++    return_usage = True  # OpenAI returns usage on every non-streaming reply
+ 
+     try:
+         xlogger.debug(

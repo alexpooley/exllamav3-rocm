@@ -83,6 +83,7 @@ rocm/scripts/download_models.sh models
 |---|---|---|---|---|---|
 | Default, fastest | `rocm/tabbyapi/config.dflash2-192k.yml` | DFlash2 | 196,608 | Q8 (draft Q4) | ~23.6 GB |
 | Full context | `rocm/tabbyapi/config.mtp-256k.yml` | MTP | 262,144 | Q8 | ~23.5 GB |
+| Two cards, shared KV pool | `rocm/tabbyapi/config.two-card-kvpool.yml` | DFlash2 | 114,688 | Q8 (draft Q4) | one 4.00bpw instance per card |
 
 Measured VRAM per component (8-bit KV):
 
@@ -226,6 +227,35 @@ instead. The pool replaces the private `CPUPageCache` and also holds the recurre
 Measured on 2x RX 7900 XTX with Qwen3.8-27B EXL3 + DFlash2: a 40K-token prompt cached on one card restores
 on the other in 1.7-3.1 s, against 39 s cold, with the same greedy output. `tests_kvpool.py` runs model-free
 tests with worker processes on both cards.
+
+To run it on two cards (after the Quick start steps, which install the profile):
+
+```bash
+rocm/scripts/run_two_cards.sh config.two-card-kvpool.yml ../tabbyAPI 5800   # card 0 -> :5800, card 1 -> :5801
+```
+
+Put a router in front (we use llama-swap with both ports as members of one model), so a request goes to
+whichever card is free. The profile uses turboderp's 4.00bpw main model (`download_models.sh` fetches it).
+At 114,688 tokens it leaves headroom on 24 GB and 32 GB of host RAM with the 12 GB pool.
+
+The launcher also sets `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_`. Without them, glibc heap
+fragmentation from the 3 MiB recurrent checkpoints grew each instance to 15-18 GB RSS within hours.
+
+Our DFlash2 draft is quantized from the BF16 release instead of the Mia-AiLab EXL3 download, and it was
+faster for us (127 vs ~120 tok/s short prompts). It takes ~5 minutes on a free card:
+
+```bash
+hf download incoai/Qwen3.8-27B-DFlash2 --local-dir models/src-DFlash2
+python convert.py -i models/src-DFlash2 -o models/own-DFlash2-EXL3-5.0bpw -w models/work-dflash2 -b 5.0
+```
+
+Two more TabbyAPI notes:
+
+- `0002-usage-on-non-streaming-replies.patch`: TabbyAPI returns `usage` only when
+  `stream_options.include_usage` is set, also on non-streaming replies. OpenAI always returns it there,
+  and clients that count tokens get nothing without it.
+- `sampler-qwen38.yml`: Qwen3.8 model-card sampling (temperature 1.0, top_k 20, top_p 0.95, min_p 0.05),
+  used when a request sends no sampling. Without a preset TabbyAPI runs top_k 0 / min_p 0.
 
 ## Environment switches
 

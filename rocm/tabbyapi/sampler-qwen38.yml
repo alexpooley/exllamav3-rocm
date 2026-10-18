@@ -1,0 +1,13 @@
+# Qwen3.8 thinking-mode sampling (model card), used when a request sends none (Hermes sends none)
+temperature:
+  override: 1.0
+  force: false
+top_k:
+  override: 20
+  force: false
+top_p:
+  override: 0.95
+  force: false
+min_p:
+  override: 0.05
+  force: false
