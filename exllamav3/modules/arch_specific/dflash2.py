@@ -342,7 +342,7 @@ class DFlash2Selector(Module):
         and the whole chain run as two kernels (no per-row host round trip, no torch
         intermediates)."""
         vocab_size = vocab_size or logits.shape[-1]
-        gate = self.hidden_proj.forward(hidden.half(), params = {})
+        gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})  # [:, 1:] slice is not flat at bsz > 1
         anchor_ids = anchor_ids.long()
         bsz, rows = logits.shape[:2]
         cuda = hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)
