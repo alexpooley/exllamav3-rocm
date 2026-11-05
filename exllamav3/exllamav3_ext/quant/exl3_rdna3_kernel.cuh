@@ -46,6 +46,15 @@ __device__ __forceinline__ void wave_sync()
 
 using exl3_rdna3_had::had128;
 
+// Workgroup barrier that orders LDS only. __syncthreads also waits for every outstanding global load
+// (vmcnt(0)), which drains the weight prefetch ring at each x chunk
+__device__ __forceinline__ void lds_barrier()
+{
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
 // 64-bit funnel: (a:b) >> s, low 32 bits, 0 <= s < 64
 __device__ __forceinline__ uint32_t fsh(uint32_t b, uint32_t a, int s)
 {
@@ -67,6 +76,44 @@ struct Funnel
     }
 };
 
+// idx * 0x83DCD12D (mod 2^32) for the 16-bit window in the low (H = 0) or high (H = 1) half of y, read in
+// place (upper bits of y are ignored): idx * 0xD12D + ((idx * 0x83DC) mod 2^16) << 16. v_pk_mul_lo_u16
+// against 0x83DC0000 leaves the second term in the high half (low lane times 0), v_mad_u32_u16 adds the
+// first. Two full-rate ops per window instead of three (codebook.cuh mul1_mul), and no mask / extract.
+// Same integer result, so the decode is bit-identical
+#ifndef EXL3_RDNA3_OLD_MUL
+template <int H>
+__device__ __forceinline__ uint32_t mul1_mul_half(uint32_t y)
+{
+    uint32_t t, r;
+    const uint32_t chi = 0x83dc0000u, clo = 0xd12du;
+    if constexpr (H)
+    {
+        asm ("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(t) : "v"(y), "s"(chi));
+        asm ("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(r) : "v"(y), "s"(clo), "v"(t));
+    }
+    else
+    {
+        asm ("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(t) : "v"(y), "s"(chi));
+        asm ("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(r) : "v"(y), "s"(clo), "v"(t));
+    }
+    return r;
+}
+#else
+template <int H>
+__device__ __forceinline__ uint32_t mul1_mul_half(uint32_t y)
+{
+    return mul1_mul(H ? (y >> 16) : (y & 0xffff));
+}
+#endif
+
+// fp16 raw codebook pair from two products (see mul1_raw_pair)
+__device__ __forceinline__ uint32_t mul1_raw_pair_p(uint32_t p0, uint32_t p1)
+{
+    const uint32_t s = __builtin_amdgcn_sad_u8(p0, 0u, 0x64006400u);
+    return __builtin_amdgcn_sad_hi_u8(p1, 0u, s);
+}
+
 // mul1 codebook, raw form: fp16 bit pattern of 1024 + bytesum(idx * 0x83DCD12D) for two 16-bit windows,
 // packed as half2. The affine map to the codebook value (k_inv * h + k_bias) is applied to the dot products
 // instead (see the kernel epilogue), saving the per-weight fma
@@ -79,8 +126,7 @@ __device__ __forceinline__ uint32_t mul1_raw_pair(uint32_t x0, uint32_t x1)
     uint32_t s1 = __builtin_amdgcn_sad_u8(mul1_mul(x1), 0u, 0x6400u);
     return s0 | (s1 << 16);
 #else
-    const uint32_t s = __builtin_amdgcn_sad_u8(mul1_mul(x0), 0u, 0x64006400u);
-    return __builtin_amdgcn_sad_hi_u8(mul1_mul(x1), 0u, s);
+    return mul1_raw_pair_p(mul1_mul_half<0>(x0), mul1_mul_half<0>(x1));
 #endif
 }
 
@@ -346,9 +392,13 @@ __device__ __forceinline__ void exl3_rdna3_unit
 #endif
 
     // x chunk, [MR][KCS][4] pairs: .x = x[16 ks + 2q .. +1], .y = x[16 ks + 8 + 2q .. +1]
+    // The x chunk and the reduction buffer share LDS (red is used only after the main loop). Separate
+    // arrays took 20.5 KB per block at 8 rows: 6 blocks per WGP, so a 320-block grid (N = 5120 with 8
+    // k-splits) ran a second partial round; 16.4 KB fits 7 (336)
+    static_assert(MR * KCS * 4 * sizeof(uint2) >= MR * 128 * sizeof(float), "red must fit in the x chunk");
     __shared__ uint2 xs[MR * KCS * 4];
     __shared__ uint32_t stage[RAW ? 1 : EXL3_RDNA3_NT][2][TWORDS];
-    __shared__ float red[MR][128];
+    float (*red)[128] = reinterpret_cast<float (*)[128]>(xs);
     __shared__ float xsum[MR];
     __shared__ int last_flag;
 
@@ -375,8 +425,18 @@ __device__ __forceinline__ void exl3_rdna3_unit
         {
             float s = 0.0f;
             if ((int) threadIdx.x < rows)
-                for (int c = ks_begin / 8; c < ks_end / 8; ++c)
-                    s += xcs[(size_t) (row0 + threadIdx.x) * (kslices / 8) + c];
+            {
+                const float* xp = xcs + (size_t) (row0 + threadIdx.x) * (kslices / 8);
+                const int c1 = ks_end / 8;
+                for (int c = ks_begin / 8; c < c1; c += 8)
+                {
+                    float v[8];
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) v[u] = c + u < c1 ? xp[c + u] : 0.0f;
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) if (c + u < c1) s += v[u];
+                }
+            }
             xsum[threadIdx.x] = s;
         }
     }
@@ -397,65 +457,75 @@ __device__ __forceinline__ void exl3_rdna3_unit
             #pragma unroll
             for (int a = 0; a < NACC; ++a) acc[m][j][a] = 0.0f;
 
-    for (int kc0 = ks_begin; kc0 < ks_end; kc0 += KCS)
+    // Weight prefetch first, so the stream is in flight while x is staged. Main loop below: one
+    // n-tile per wave, all k-slices of the chunk. nk is a multiple of PF (chunks
+    // are whole 128-element blocks), so the unrolled body is branch-free; the prefetch past the
+    // end re-reads the last slice instead of branching, which keeps vmcnt waits incremental
+    uint32_t pf[PF][TPW][LPT];
+    int lofs[LPT];
+    #pragma unroll
+    for (int l = 0; l < LPT; ++l) lofs[l] = min(l * 32 + lane, TWORDS - 1);
+    if constexpr (DIRECT)
     {
-        const int nk = min(ks_end - kc0, KCS);   // multiple of 8
-        const int nch = nk / 8;                  // 128-element blocks per row
+        // Word indices in windows8's gather order, from windows8 itself (so the two can't disagree)
+        int c = 0;
+        uint32_t unused[8];
+        auto record = [&] (int jw) -> uint32_t { lofs[c++] = jw; return 0u; };
+        windows8<bits>(record, lane, unused);
+    }
 
-        // Weight prefetch first, so the stream is in flight while x is staged. Main loop below: one
-        // n-tile per wave, all k-slices of the chunk. nk is a multiple of PF (chunks
-        // are whole 128-element blocks), so the unrolled body is branch-free; the prefetch past the
-        // end re-reads the last slice instead of branching, which keeps vmcnt waits incremental
-        uint32_t pf[PF][TPW][LPT];
-        int lofs[LPT];
+    // Per-lane byte offset within a k-slice row (vector) + k-slice offset (uniform, scalar), 32-bit
+    uint32_t voff[TPW][LPT];
+    #pragma unroll
+    for (int j = 0; j < TPW; ++j)
         #pragma unroll
-        for (int l = 0; l < LPT; ++l) lofs[l] = min(l * 32 + lane, TWORDS - 1);
-        if constexpr (DIRECT)
-        {
-            // Word indices in windows8's gather order, from windows8 itself (so the two can't disagree)
-            int c = 0;
-            uint32_t unused[8];
-            auto record = [&] (int jw) -> uint32_t { lofs[c++] = jw; return 0u; };
-            windows8<bits>(record, lane, unused);
-        }
+        for (int l = 0; l < LPT; ++l) voff[j][l] = (uint32_t) ((nt0 + j * WAVES) * TWORDS + lofs[l]) * 4u;
+    const uint32_t sstride_b = (uint32_t) sstride * 4u;
+    auto ldw = [&] (int slice, int j, int l) -> uint32_t
+    {
+        const uint32_t soff = (uint32_t) slice * sstride_b;
+        return __builtin_amdgcn_raw_buffer_load_b32(brsrc, voff[j][l], soff, 6);   // slc | dlc: streaming
+    };
 
-        // Per-lane byte offset within a k-slice row (vector) + k-slice offset (uniform, scalar), 32-bit
-        uint32_t voff[TPW][LPT];
+    #pragma unroll
+    for (int d = 0; d < PF; ++d)
         #pragma unroll
         for (int j = 0; j < TPW; ++j)
             #pragma unroll
-            for (int l = 0; l < LPT; ++l) voff[j][l] = (uint32_t) ((nt0 + j * WAVES) * TWORDS + lofs[l]) * 4u;
-        const uint32_t sstride_b = (uint32_t) sstride * 4u;
-        auto ldw = [&] (int slice, int j, int l) -> uint32_t
-        {
-            const uint32_t soff = (uint32_t) slice * sstride_b;
-            return __builtin_amdgcn_raw_buffer_load_b32(brsrc, voff[j][l], soff, 6);   // slc | dlc: streaming
-        };
+            for (int l = 0; l < LPT; ++l)
+                pf[d][j][l] = ldw(min(ks_begin + d, ks_end - 1), j, l);
 
-        #pragma unroll
-        for (int d = 0; d < PF; ++d)
-            #pragma unroll
-            for (int j = 0; j < TPW; ++j)
-                #pragma unroll
-                for (int l = 0; l < LPT; ++l)
-                    pf[d][j][l] = ldw(kc0 + d, j, l);
+    for (int kc0 = ks_begin; kc0 < ks_end; kc0 += KCS)
+    {
+        const int nk = min(ks_end - kc0, KCS);   // multiple of 8
 
         // Stage this chunk of the transformed input: nk * 32 contiguous bytes per row, 16-byte copies.
         // Rows past size_m are zero so the unrolled MAC loop needs no row guards
-        __syncthreads();
+        lds_barrier();
         {
+            // xs as uint4: index m * (2 * KCS) + j, j < 2 * nk
+            constexpr int XS_V = MR * KCS * 2;
+            constexpr int NV = (XS_V + THREADS - 1) / THREADS;
             const int per_row = nk * 2;   // uint4 per row
-            for (int idx = threadIdx.x; idx < MR * per_row; idx += THREADS)
+            uint4 v[NV];
+            #pragma unroll
+            for (int u = 0; u < NV; ++u)
             {
-                const int m = idx / per_row;
-                const int j = idx % per_row;
-                uint4 v = make_uint4(0, 0, 0, 0);
-                if (m < rows)
-                    v = ((const uint4*) (xh + ((size_t) (row0 + m) * kslices + kc0) * 4))[j];
-                ((uint4*) (xs + (size_t) m * KCS * 4))[j] = v;
+                const int idx = threadIdx.x + u * THREADS;
+                const int m = idx / (2 * KCS);
+                const int j = idx % (2 * KCS);
+                v[u] = make_uint4(0, 0, 0, 0);
+                if (idx < XS_V && m < rows && j < per_row)
+                    v[u] = ((const uint4*) (xh + ((size_t) (row0 + m) * kslices + kc0) * 4))[j];
+            }
+            #pragma unroll
+            for (int u = 0; u < NV; ++u)
+            {
+                const int idx = threadIdx.x + u * THREADS;
+                if (idx < XS_V && (idx % (2 * KCS)) < per_row) ((uint4*) xs)[idx] = v[u];
             }
         }
-        __syncthreads();
+        lds_barrier();
 
         for (int ib = 0; ib < nk; ib += PF)
         {
@@ -475,14 +545,14 @@ __device__ __forceinline__ void exl3_rdna3_unit
                     // Refill slot d once its words are consumed (after the gathers below), so the load can
                     // target the same registers: loading earlier makes the compiler rename the ring and copy
                     // it back at the loop edge, which waits for every outstanding load (vmcnt(0))
-                    const int inext = min(i + PF, nk - 1);
+                    const int gnext = min(kc0 + i + PF, ks_end - 1);
                     // Buffer-load intrinsic: with plain loads InstCombine folds phi(load, load) into
                     // load(phi(addr)), moving the prefetch to the point of use and serializing the stream
                     auto refill = [&] ()
                     {
                         #pragma unroll
                         for (int l = 0; l < LPT; ++l)
-                            pf[d][j][l] = ldw(kc0 + inext, j, l);
+                            pf[d][j][l] = ldw(gnext, j, l);
                         // Pin the load here: the scheduler otherwise sinks the refills to the loop end in
                         // reverse order, and the next iteration's first use then waits for all of them
                         __builtin_amdgcn_sched_barrier(0);
@@ -509,13 +579,31 @@ __device__ __forceinline__ void exl3_rdna3_unit
                                 return j < 32 ? lo : hi;
                             }
                         };
-                        uint32_t win[8];
-                        windows8<bits>(gather, lane, win);
-                        refill();
-                        w00 = mul1_raw_pair(win[0], win[1]);
-                        w01 = mul1_raw_pair(win[2], win[3]);
-                        w10 = mul1_raw_pair(win[4], win[5]);
-                        w11 = mul1_raw_pair(win[6], win[7]);
+                        if constexpr (bits == 4)
+                        {
+                            // Windows at bit offsets 0, 4, .. 28 of (a:b) (windows8: w7 .. w0). Each funnel
+                            // y_t = (a:b) >> t holds windows t (low half) and t + 16 (high half)
+                            const uint32_t a = gather((lane + 31) & 31);
+                            const uint32_t b = gather(lane);
+                            const uint32_t y4 = __builtin_amdgcn_alignbit(a, b, 4);
+                            const uint32_t y8 = __builtin_amdgcn_alignbit(a, b, 8);
+                            const uint32_t y12 = __builtin_amdgcn_alignbit(a, b, 12);
+                            refill();
+                            w00 = mul1_raw_pair_p(mul1_mul_half<1>(y12), mul1_mul_half<1>(y8));   // w0, w1
+                            w01 = mul1_raw_pair_p(mul1_mul_half<1>(y4), mul1_mul_half<1>(b));     // w2, w3
+                            w10 = mul1_raw_pair_p(mul1_mul_half<0>(y12), mul1_mul_half<0>(y8));   // w4, w5
+                            w11 = mul1_raw_pair_p(mul1_mul_half<0>(y4), mul1_mul_half<0>(b));     // w6, w7
+                        }
+                        else
+                        {
+                            uint32_t win[8];
+                            windows8<bits>(gather, lane, win);
+                            refill();
+                            w00 = mul1_raw_pair(win[0], win[1]);
+                            w01 = mul1_raw_pair(win[2], win[3]);
+                            w10 = mul1_raw_pair(win[4], win[5]);
+                            w11 = mul1_raw_pair(win[6], win[7]);
+                        }
                     }
                     else
                     {
@@ -551,6 +639,8 @@ __device__ __forceinline__ void exl3_rdna3_unit
         }
     }
 
+    KB_T(1);
+
     if constexpr (NACC == 4)
     {
         #pragma unroll
@@ -562,6 +652,9 @@ __device__ __forceinline__ void exl3_rdna3_unit
                 acc[m][j][1] += acc[m][j][3];
             }
     }
+
+    // Every wave is done reading the x chunk before red overwrites it
+    lds_barrier();
 
     // Reduce over the four lanes sharing a column; lane l holds columns l / 4 and 8 + l / 4 of its tile
     #pragma unroll
@@ -721,7 +814,6 @@ void exl3_rdna3_kernel
         blockIdx.z, blockIdx.y, blockIdx.x % groups, blockIdx.x / groups, gridDim.y,
         xh, B, C, size_m, size_k, size_n, counters, xcs, ws, svh, splits, ks_per_split, mt
     );
-    KB_T(1);
     KB_T(2);
 }
 
