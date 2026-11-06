@@ -335,12 +335,14 @@ class DFlash2Selector(Module):
         vocab_size: int | None = None,
         scale: float = 1.0,
         softcap: float = 0.0,
+        col_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """walk() in the generator's block layout: ids [b, rows + 1] = [anchor, path...] and,
         when requested, confidence [b, rows + 1] = [0, winning score...]. logits may be wider
         than vocab_size (padded head) and are scaled / softcapped on the fly. On CUDA the top-k
         and the whole chain run as two kernels (no per-row host round trip, no torch
-        intermediates)."""
+        intermediates). col_ids [n] maps logit columns to vocabulary ids when the logits cover
+        only a subset of the vocabulary (sparse draft head); the top-k then runs within it."""
         vocab_size = vocab_size or logits.shape[-1]
         gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})  # [:, 1:] slice is not flat at bsz > 1
         anchor_ids = anchor_ids.long()
@@ -355,6 +357,8 @@ class DFlash2Selector(Module):
             if softcap > 0.0:
                 logits = torch.tanh(logits / softcap) * softcap
             unary, cands = torch.topk(logits, self.top_k, dim = -1, sorted = False)
+        if col_ids is not None:
+            cands = col_ids[cands]
         if cuda:
             out = torch.empty((bsz, rows + 1), dtype = torch.long, device = hidden.device)
             conf = torch.empty((bsz, rows + 1), dtype = torch.float, device = hidden.device) if return_confidence else None

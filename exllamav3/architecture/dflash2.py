@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import weakref
+import os
 
 from ..cache import Cache
 from ..model.config import no_default
@@ -216,6 +217,15 @@ class DFlash2Model(Model):
 
         self.attached_model = None
 
+        # Sparse draft head (EXL3_SPARSE_DRAFT_HEAD=K): the drafter's logits over the K most frequent
+        # tokens of a profile (EXL3_SDH_PROFILE, from sdh_mkprofile.py; without one, the first K token
+        # ids) instead of the target's full head. Verification stays full-vocab, so the output is
+        # unchanged; only the proposals (and so tokens per round) can differ
+        self.sdh_capacity = int(os.environ.get("EXL3_SPARSE_DRAFT_HEAD", "0") or 0)
+        self.sdh_profile = os.environ.get("EXL3_SDH_PROFILE") or None
+        self.sdh_weight = None      # [K, hidden] fp16, rows = target head columns
+        self.sdh_cols = None        # [K] vocabulary id of each row
+
         self.draft_verifier_params.update({
             "export_state_layers": set(config.target_layer_ids),
         })
@@ -257,6 +267,34 @@ class DFlash2Model(Model):
         dflash_update_kv_from_target(self, target_hidden, cache, params, lengths)
 
 
+    @torch.inference_mode()
+    def _build_sparse_head(self, lm, vocab_size: int, chunk: int = 256):
+        """Extract the target head's columns for the hot subset as a dense fp16 [K, hidden] matrix.
+        The head is linear (no softcap), so its forward on unit rows returns its effective weight,
+        Hadamard rotations and scales included, whatever the storage format"""
+        assert lm.softcap == 0.0, "sparse draft head needs a linear target head"
+        k = min(self.sdh_capacity, vocab_size)
+        if self.sdh_profile:
+            ids = torch.load(self.sdh_profile, map_location = "cpu", weights_only = True)["ids"].long()
+            ids = ids[ids < vocab_size][:k]
+        else:
+            ids = torch.arange(k)
+        dev = lm.device
+        ids = ids.to(dev)
+        hidden = lm.in_features_unpadded
+        w = torch.empty((ids.numel(), hidden), dtype = torch.half, device = dev)
+        for i in range(0, hidden, chunk):
+            n = min(chunk, hidden - i)
+            x = torch.zeros((1, n, hidden), dtype = torch.half, device = dev)
+            x[0, torch.arange(n), torch.arange(i, i + n)] = 1.0
+            y = lm.forward(x, {}, out_dtype = torch.float)
+            w[:, i : i + n] = y[0].index_select(1, ids).t().half()
+            del x, y
+        self.sdh_weight = w
+        self.sdh_cols = ids
+        torch.cuda.empty_cache()
+
+
     def sample_from_state(
         self,
         state: torch.Tensor,
@@ -269,8 +307,17 @@ class DFlash2Model(Model):
         target verifier still samples normally and accepts only exact matches."""
         target = self.attached_model()
         lm = target.modules[target.logit_layer_idx]
-        logits = lm.prepare_for_device(state.half(), params)
-        logits = lm.forward(logits, params)
+        if self.sdh_capacity and self.sdh_weight is None:
+            self._build_sparse_head(lm, target.config.vocab_size)
+        if self.sdh_weight is not None:
+            # Sparse draft head: fp16 logits over the hot subset only, for the rows the walk reads
+            x = to_device(state[:, 1:].half(), self.sdh_weight.device)
+            logits = torch.nn.functional.linear(x, self.sdh_weight)
+            col_ids, vocab = self.sdh_cols, self.sdh_weight.shape[0]
+        else:
+            logits = lm.prepare_for_device(state.half(), params)
+            logits = lm.forward(logits, params)[:, 1:]
+            col_ids, vocab = None, target.config.vocab_size
 
         dev = self.selector.device
         # The generator stages the block ids in pinned memory: upload without a host sync
@@ -282,11 +329,12 @@ class DFlash2Model(Model):
         # (draft's last block) and the logits (target's head) may sit on other devices than
         # the selector: to_device bounces pairs with a broken peer path through the host
         out, confidence = self.selector.walk_block(
-            to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
+            to_device(state[:, 1:], dev), to_device(logits, dev), anchor,
             return_confidence = export_conf,
-            vocab_size = target.config.vocab_size,
+            vocab_size = vocab,
             scale = self.config.output_multiplier,
             softcap = self.config.final_logit_softcapping,
+            col_ids = None if col_ids is None else to_device(col_ids, dev),
         )
         if export_conf:
             params["draft_conf"] = confidence
