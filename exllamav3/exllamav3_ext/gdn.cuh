@@ -246,6 +246,29 @@ struct StateRewindJob
         src(_src), dst(_dst), num_elements(_num_elements) {}
 };
 
+// Log-mode rewind (gdn_core_mk with history): state slot 0 <- slot 1 advanced over the first n logged tokens
+struct StateReplayJob
+{
+    uintptr_t state;            // this layer's state slot base (recurrent_state[slot])
+    uintptr_t dt_bias;          // [H] bf16
+    uintptr_t a_log;            // [H] fp32 or bf16
+    int a_log_f32;
+    float beta_scale;
+    int num_k_heads;
+    int num_v_heads;
+    int F;
+    int n;
+
+    StateReplayJob() = default;
+    StateReplayJob(uintptr_t _state, uintptr_t _dt_bias, uintptr_t _a_log, int _a_log_f32, float _beta_scale,
+                   int _num_k_heads, int _num_v_heads, int _F, int _n) :
+        state(_state), dt_bias(_dt_bias), a_log(_a_log), a_log_f32(_a_log_f32), beta_scale(_beta_scale),
+        num_k_heads(_num_k_heads), num_v_heads(_num_v_heads), F(_F), n(_n) {}
+};
+
+void batched_state_replay(std::vector<StateReplayJob> const& jobs, int device_index);
+void gdn_replay_set(int enable);
+
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
 void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);
 
@@ -276,7 +299,8 @@ bool gdn_core_mk
     const c10::optional<at::Tensor>& gn_g,
     float gn_eps,
     float gn_bias,
-    bool gn_sigmoid
+    bool gn_sigmoid,
+    bool* used_log_mode = nullptr
 );
 
 void gdn_mk_set(int enable);

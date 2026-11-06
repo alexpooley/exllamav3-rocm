@@ -45,13 +45,13 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
-            conv_jobs, state_jobs = jobs_by_device.setdefault(device_index, ([], []))
+            conv_jobs, state_jobs, replay_jobs = jobs_by_device.setdefault(device_index, ([], [], []))
             cj = l.rewind_conv_job(slot, last_history, num_tokens)
             if cj is not None:
                 conv_jobs.append(cj)
             sj = l.rewind_state_job(slot, last_history, num_tokens)
             if sj is not None:
-                state_jobs.append(sj)
+                (replay_jobs if isinstance(sj, ext.StateReplayJob) else state_jobs).append(sj)
         else:
             l.rewind(slot, last_history, num_tokens)
     return jobs_by_device
@@ -74,7 +74,7 @@ def _cached_rewind_jobs(cache, layers: dict, slot: int, last_history: int, num_t
     if (len(layers), vals[0].conv_state.data_ptr(), vals[-1].recurrent_state.data_ptr()) != sig:
         store.clear()
         return _cached_rewind_jobs(cache, layers, slot, last_history, num_tokens)
-    key = (slot, last_history, num_tokens)
+    key = (slot, last_history, num_tokens, vals[0].log_mode[slot])
     jobs = store.get(key)
     if jobs is None:
         jobs = store[key] = _collect_rewind_jobs(vals, slot, last_history, num_tokens)
@@ -82,11 +82,13 @@ def _cached_rewind_jobs(cache, layers: dict, slot: int, last_history: int, num_t
 
 
 def _dispatch_rewind_jobs(jobs_by_device):
-    for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
+    for device_index, (conv_jobs, state_jobs, replay_jobs) in jobs_by_device.items():
         if conv_jobs:
             ext.batched_conv_rewind(conv_jobs, device_index)
         if state_jobs:
             ext.batched_state_rewind(state_jobs, device_index)
+        if replay_jobs:
+            ext.batched_state_replay(replay_jobs, device_index)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
@@ -223,6 +225,9 @@ class GDNLayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
+        # Per slot: the last history forward ran in log mode (gdn_core_mk): slot 0 holds the final state, slot 1
+        # the start state and slot 2 the logged inputs; a rewind replays the accepted prefix from slot 1
+        self.log_mode = [False] * max_batch_size
 
 
     def get_checkpoint_size(self):
@@ -265,7 +270,9 @@ class GDNLayerState:
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
         assert num_tokens <= last_history
-        if num_tokens > 0:
+        if num_tokens > 0 and self.log_mode[slot]:
+            ext.batched_state_replay([self.rewind_state_job(slot, last_history, num_tokens)], torch.device(self.device).index)
+        elif num_tokens > 0:
             r_state = self.recurrent_state[slot, 0]
             r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
             r_state.copy_(r_state_rewind)
@@ -308,6 +315,12 @@ class GDNLayerState:
         rs = self.recurrent_state
         es = rs.element_size()
         base = rs.data_ptr() + slot * rs.stride(0) * es
+        if self.log_mode[slot]:
+            m = self.module
+            return ext.StateReplayJob(
+                base, m.dt_bias.data_ptr(), m.a_log.data_ptr(), int(m.a_log.dtype == torch.float), float(m.beta_scale),
+                m.num_k_heads, m.num_v_heads, m.fdim_qkv, last_history + 1 - num_tokens,
+            )
         return ext.StateRewindJob(
             base + (last_history + 1 - num_tokens) * rs.stride(1) * es,
             base,
@@ -1100,7 +1113,9 @@ class GatedDeltaNet(Module):
                 else:
                     self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            log_used = self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            if save_history:
+                for r in rsg: rsl.log_mode[r.slot] = log_used
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
@@ -1173,6 +1188,9 @@ class GatedDeltaNet(Module):
                 beta, g,
                 self.beta_scale
             )
+
+        if save_history:
+            for r in rsg: rsl.log_mode[r.slot] = False
 
         # Convolution
         mixed_qkv = causal_conv1d_update(

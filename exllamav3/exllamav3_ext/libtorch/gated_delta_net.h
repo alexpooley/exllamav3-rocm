@@ -327,7 +327,7 @@ struct BC_GatedDeltaNetSplit
         at::Tensor o_xh
     );
 
-    void run_bszN_gr
+    bool run_bszN_gr
     (
         const at::Tensor& x,
         at::Tensor& y,
@@ -339,7 +339,7 @@ struct BC_GatedDeltaNetSplit
         Graph* graph
     );
 
-    void run_bszN
+    bool run_bszN
     (
         const at::Tensor& x,
         at::Tensor& y,

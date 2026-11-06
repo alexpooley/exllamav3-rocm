@@ -2232,6 +2232,156 @@ void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_in
 #include "quant/exl3_rdna3.cuh"
 #include "quant/exl3_rdna3_had.cuh"
 
+// Log mode layout inside one state slot of a 128x128-head GDN layer (nv v heads, F conv channels):
+//   [0]             live state
+//   [1]             state at the start of the last history launch
+//   [2] onwards     conv outputs, bf16 [GDN_LOG_MAXS, F], then b/a, fp32 [GDN_LOG_MAXS, 2 * nv]
+#define GDN_LOG_MAXS 64
+static inline size_t gdn_log_bytes(int nv, int F)
+{
+    return (size_t) GDN_LOG_MAXS * F * sizeof(uint16_t) + (size_t) GDN_LOG_MAXS * 2 * nv * sizeof(float);
+}
+__device__ __forceinline__ bfloat16* gdn_log_qkv(float* slot_base, int nv)
+{
+    return (bfloat16*) (slot_base + 2 * (size_t) nv * 128 * 128);
+}
+__device__ __forceinline__ float* gdn_log_ba(float* slot_base, int nv, int F)
+{
+    return (float*) (gdn_log_qkv(slot_base, nv) + (size_t) GDN_LOG_MAXS * F);
+}
+
+static int g_gdn_replay = -1;   // -1: from EXL3_GDN_REPLAY (default on)
+
+void gdn_replay_set(int enable)
+{
+    g_gdn_replay = enable;
+}
+
+static bool gdn_replay_enabled()
+{
+    if (g_gdn_replay >= 0) return g_gdn_replay != 0;
+    static const bool e = !(std::getenv("EXL3_GDN_REPLAY") && std::getenv("EXL3_GDN_REPLAY")[0] == '0');
+    return e;
+}
+
+// Rewind of a log-mode launch: live state <- the start state advanced over the first n logged tokens. Same
+// arithmetic, term for term and in the same order, as stage 2 of gdn_core_mk_kernel, so the result is
+// bit-identical to the state that kernel reached after token n. One block per (layer job, v head, 32 columns).
+struct StateReplayJobBatch { StateReplayJob jobs[REWIND_MAX_JOBS]; int num_jobs; };
+
+__global__ __launch_bounds__(128)
+void batched_state_replay_kernel(StateReplayJobBatch batch)
+{
+    const StateReplayJob& j = batch.jobs[blockIdx.y];
+    constexpr int HEAD_DIM = 128;
+    constexpr int NSUB = 4;
+    constexpr int BTS = HEAD_DIM / NSUB;
+    constexpr size_t HEAD_STATE_SIZE = HEAD_DIM * HEAD_DIM;
+    const int num_v_heads = j.num_v_heads;
+    const int num_k_heads = j.num_k_heads;
+    if ((int) blockIdx.x >= num_v_heads * 4) return;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int t = tid & 31;
+    const int bt = tid >> 5;
+    const int group = num_v_heads / num_k_heads;
+    const int head = blockIdx.x / 4;
+    const int v_start = (blockIdx.x % 4) * 32;
+    const int k_head = head / group;
+    const size_t state_size = (size_t) num_v_heads * HEAD_STATE_SIZE;
+
+    float* slot_state = (float*) j.state;
+    const bfloat16* mixed_qkv = gdn_log_qkv(slot_state, num_v_heads);
+    const float* ba = gdn_log_ba(slot_state, num_v_heads, j.F);
+
+    const float dt_bias_h = as_float(((const bfloat16*) j.dt_bias)[head]);
+    const float a_exp_h = __expf(j.a_log_f32 ? ((const float*) j.a_log)[head] : as_float(((const bfloat16*) j.a_log)[head]));
+
+    __shared__ float sh_red[HEAD_DIM / 32];
+    __shared__ float sh_k[HEAD_DIM];
+    __shared__ float sh_dot1[NSUB][32];
+
+    const size_t col_off = (size_t) head * HEAD_STATE_SIZE + v_start + t + (size_t) bt * BTS * HEAD_DIM;
+    float st[BTS];
+    #pragma unroll
+    for (int i = 0; i < BTS; ++i) st[i] = slot_state[state_size + col_off + (size_t) i * HEAD_DIM];
+
+    for (int s = 0; s < j.n; ++s)
+    {
+        const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * HEAD_DIM;
+        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
+
+        float k = __bfloat162float(gl_k[tid]);
+        float sumk = k * k;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
+        if (lane == 0) sh_red[warp] = sumk;
+        __syncthreads();
+        sumk = lane < HEAD_DIM / 32 ? sh_red[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
+        sh_k[tid] = k * rsqrtf(sumk + 1e-6f);
+        __syncthreads();
+
+        const float* sk = sh_k + bt * BTS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) sum = sum + sk[i] * st[i];
+        sh_dot1[bt][t] = sum;
+        __syncthreads();
+
+        const float bv = ba[(size_t) s * 2 * num_v_heads + head];
+        const float av = ba[(size_t) s * 2 * num_v_heads + num_v_heads + head];
+        const float gv = -softplus(av + dt_bias_h) * a_exp_h;
+        const float g_h = __expf(gv);
+        const float beta_h = __bfloat162float(trunc_bf16(_sigmoid_fast_exp(bv) * j.beta_scale));
+        float dot1 = 0.0f;
+        #pragma unroll
+        for (int jj = 0; jj < NSUB; ++jj) dot1 += sh_dot1[jj][t];
+        const float v = __bfloat162float(gl_v[t]) - dot1 * g_h;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i)
+        {
+            float state = st[i];
+            state = state * g_h + sk[i] * v * beta_h;
+            st[i] = state;
+        }
+        __syncthreads();
+
+        mixed_qkv += 2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < BTS; ++i) slot_state[col_off + (size_t) i * HEAD_DIM] = st[i];
+}
+
+void batched_state_replay(std::vector<StateReplayJob> const& jobs, int device_index)
+{
+    if (jobs.empty()) return;
+    c10::cuda::CUDAGuard device_guard((c10::DeviceIndex) device_index);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    for (size_t base = 0; base < jobs.size(); base += REWIND_MAX_JOBS)
+    {
+        int n = (int) MIN(jobs.size() - base, (size_t) REWIND_MAX_JOBS);
+        StateReplayJobBatch batch;
+        batch.num_jobs = n;
+        int max_heads = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            batch.jobs[i] = jobs[base + i];
+            TORCH_CHECK(batch.jobs[i].n >= 1 && batch.jobs[i].n <= GDN_LOG_MAXS, "batched_state_replay: bad token count");
+            max_heads = MAX(max_heads, batch.jobs[i].num_v_heads);
+        }
+        dim3 blocks(max_heads * 4, n);
+        batched_state_replay_kernel<<<blocks, 128, 0, stream>>>(batch);
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
 // Grid-wide barrier for a normally launched kernel whose blocks are all co-resident (the caller keeps the
 // grid far below one wave of residency). Single use per launch: the last block to arrive resets the counter
 // and publishes this launch's epoch, which the host advances every launch, so no reset kernel is needed
@@ -2291,6 +2441,9 @@ struct GdnCoreArgs
     int num_v_heads;
     float scale;
     int history_stride;
+    // log mode (history mode 2): the start state goes to slot 1 and this launch's conv outputs and b/a to the
+    // slot-2 region, for batched_state_replay to rebuild any accepted prefix
+    int log_mode;
     // grid barrier
     unsigned* bar;
     unsigned epoch;
@@ -2303,6 +2456,13 @@ struct GdnCoreArgs
     Exl3Rdna3GNorm gn;
     const void* gn_g;               // gate (z), [B, S, H, 128]
 };
+
+// Base of batch row 0's state slot (B == 1 in this kernel), where log mode keeps its slots 1 and 2
+__device__ __forceinline__ float* gdn_mk_slot_base(const GdnCoreArgs& a)
+{
+    const int slot = a.slots ? a.slots[0] : 0;
+    return a.recurrent_state + (size_t) slot * a.history_stride * ((size_t) a.num_v_heads * 128 * 128);
+}
 
 // One (row m, head c) task of exl3_rdna3_had_kernel with an active gated RMSNorm, same arithmetic
 __device__ __forceinline__ void gdn_mk_gnorm_had_task(const GdnCoreArgs& a, int m, int c, int lane)
@@ -2399,6 +2559,7 @@ __device__ __forceinline__ void gdn_mk_ba_task(const GdnCoreArgs& a, int task, i
     {
         if (a.ba_bias) sum += __half2float(a.ba_bias[row]);
         a.ba[(size_t) r * a.n_ba + row] = sum;
+        if (a.log_mode) gdn_log_ba(gdn_mk_slot_base(a), a.num_v_heads, a.F)[(size_t) r * a.n_ba + row] = sum;
     }
 }
 
@@ -2446,6 +2607,7 @@ __device__ __forceinline__ void gdn_mk_conv_task(const GdnCoreArgs& a, int d, in
         acc *= _sigmoid_fast_exp(acc);
 
         a.conv_out[((size_t) b * seqlen + s) * dim + d] = __float2bfloat16_rn(acc);
+        if (a.log_mode) gdn_log_qkv(gdn_mk_slot_base(a), a.num_v_heads)[(size_t) s * dim + d] = __float2bfloat16_rn(acc);
 
         #pragma unroll
         for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
@@ -2480,10 +2642,13 @@ __device__ __forceinline__ void gdn_mk_conv_task(const GdnCoreArgs& a, int d, in
     }
 }
 
-template <bool save_history>
+// HM: 0 no history, 1 per-token states in history slots 1..S-1 (rewind by copy), 2 log mode (start state in
+// slot 1, inputs logged, rewind by batched_state_replay)
+template <int HM>
 __global__ __launch_bounds__(128)
 void gdn_core_mk_kernel(const GdnCoreArgs a)
 {
+    constexpr bool save_history = HM == 1;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -2495,7 +2660,7 @@ void gdn_core_mk_kernel(const GdnCoreArgs a)
             gdn_mk_ba_task(a, task, lane);
         const int num_threads = gridDim.x * 128;
         for (int c = blockIdx.x * 128 + tid; c < a.B * a.F; c += num_threads)
-            gdn_mk_conv_task<save_history>(a, c % a.F, c / a.F);
+            gdn_mk_conv_task<HM != 0>(a, c % a.F, c / a.F);
     }
 
     gdn_mk_grid_barrier(a.bar, a.epoch);
@@ -2542,6 +2707,11 @@ void gdn_core_mk_kernel(const GdnCoreArgs a)
     float st[BTS];
     #pragma unroll
     for (int i = 0; i < BTS; ++i) st[i] = slot_state[col_off + (size_t) i * HEAD_DIM];
+    if constexpr (HM == 2)
+    {
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) slot_state[state_size + col_off + (size_t) i * HEAD_DIM] = st[i];
+    }
 
     for (int s = 0; s < seqlen; ++s)
     {
@@ -2647,6 +2817,14 @@ void gdn_core_mk_kernel(const GdnCoreArgs a)
 
 #endif  // __HIP_PLATFORM_AMD__
 
+#ifndef __HIP_PLATFORM_AMD__
+void gdn_replay_set(int enable) {}
+void batched_state_replay(std::vector<StateReplayJob> const& jobs, int device_index)
+{
+    TORCH_CHECK(jobs.empty(), "batched_state_replay: log mode exists only in the RDNA3 GDN megakernel");
+}
+#endif
+
 static int g_gdn_mk = -1;   // -1: from EXL3_GDN_MK (default on)
 
 void gdn_mk_set(int enable)
@@ -2688,9 +2866,11 @@ bool gdn_core_mk
     const c10::optional<at::Tensor>& gn_g,      // gate z, [B, S, H, 128] bf16 or float
     float gn_eps,
     float gn_bias,
-    bool gn_sigmoid
+    bool gn_sigmoid,
+    bool* used_log_mode
 )
 {
+    if (used_log_mode) *used_log_mode = false;
     #ifdef __HIP_PLATFORM_AMD__
         if (!gdn_mk_enabled() || !gdn_reg_enabled()) return false;
         const int B = (int) qkv.size(0);
@@ -2740,6 +2920,12 @@ bool gdn_core_mk
         a.scale = 1.0f / sqrtf((float) k_head_dim);
         a.history_stride = (int) recurrent_state.size(1);
 
+        // Log mode for a history launch: needs slots 1 (start state) and 2 (log) and the log to fit in a slot
+        const size_t state_floats = (size_t) num_v_heads * 128 * 128;
+        const bool log_mode = history && gdn_replay_enabled() && a.history_stride >= 3 && S <= GDN_LOG_MAXS &&
+            gdn_log_bytes(num_v_heads, F) <= state_floats * sizeof(float);
+        a.log_mode = log_mode ? 1 : 0;
+
         // Barrier words and per-head counters per device, zeroed once; the epoch only has to differ from
         // the previous launch's
         static unsigned* bar[MAX_DEVICES] = {};
@@ -2782,8 +2968,10 @@ bool gdn_core_mk
 
         dim3 grid(B * num_v_heads * 4);
         dim3 block(128);
-        if (history) gdn_core_mk_kernel<true><<<grid, block, 0, stream>>>(a);
-        else         gdn_core_mk_kernel<false><<<grid, block, 0, stream>>>(a);
+        if (log_mode) gdn_core_mk_kernel<2><<<grid, block, 0, stream>>>(a);
+        else if (history) gdn_core_mk_kernel<1><<<grid, block, 0, stream>>>(a);
+        else         gdn_core_mk_kernel<0><<<grid, block, 0, stream>>>(a);
+        if (used_log_mode) *used_log_mode = log_mode;
         cuda_check(cudaPeekAtLastError());
         return true;
     #else

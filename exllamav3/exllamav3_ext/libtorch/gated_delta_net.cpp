@@ -220,7 +220,7 @@ static bool gdn_fuse_gnorm()
     return e;
 }
 
-void BC_GatedDeltaNetSplit::run_bszN_gr
+bool BC_GatedDeltaNetSplit::run_bszN_gr
 (
     const at::Tensor& x,
     at::Tensor& y,
@@ -257,6 +257,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
 
     // Eager decode: the b/a GEMV, conv update and recurrence as one cooperative launch (gdn_core_mk)
     bool core_done = false;
+    bool log_used = false;
 
     if (kda)
     {
@@ -295,7 +296,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
             gnorm_path ? c10::optional<at::Tensor>(o_proj->suh) : c10::nullopt,
             gnorm_path ? c10::optional<at::Tensor>(norm->weight) : c10::nullopt,
             gnorm_path ? c10::optional<at::Tensor>(s.z) : c10::nullopt,
-            norm->rms_norm_eps, norm->constant_bias, norm->gate_act == 1
+            norm->rms_norm_eps, norm->constant_bias, norm->gate_act == 1, &log_used
         );
 
         if (!core_done)
@@ -356,9 +357,12 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     }
     if (o_proj->bias)
         add_gr(y, o_proj->bias.value(), y, graph);
+    return log_used;
 }
 
-void BC_GatedDeltaNetSplit::run_bszN
+// Returns true when the launch ran in log mode (history kept as start state + logged inputs, see gdn.cu):
+// the caller must then rewind with batched_state_replay instead of copying a history slot
+bool BC_GatedDeltaNetSplit::run_bszN
 (
     const at::Tensor& x,
     at::Tensor& y,
@@ -382,11 +386,11 @@ void BC_GatedDeltaNetSplit::run_bszN
     static const bool nograph = graph_disabled_for("gdn");
     if (nograph || s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        bool log_used = run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
-        return;
+        return log_used;
     }
 
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
@@ -395,8 +399,7 @@ void BC_GatedDeltaNetSplit::run_bszN
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
-        return;
+        return run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
     }
 
     if (!s.graph->ready)
@@ -444,6 +447,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     s.graph->launch(args, stream);
+    return false;
 }
 
 bool BC_Mamba2::needs_configure(int bsz, int seqlen, bool history)
