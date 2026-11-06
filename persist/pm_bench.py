@@ -10,13 +10,15 @@ from torch.utils.cpp_extension import load
 EXT = os.path.join(TREE, "exllamav3", "exllamav3_ext")
 
 def build():
+    var = os.environ.get("PM_VARIANT", "")
+    bdir = os.path.join(TREE, "persist", "build" + var); os.makedirs(bdir, exist_ok=True)
     return load(
-        name="persist_mlp",
+        name="persist_mlp" + var,
         sources=[os.path.join(TREE, "persist", "persist_mlp.hip")],
         extra_include_paths=[EXT],
         extra_cuda_cflags=["-O3", "-DHIPBLAS_USE_HIP_HALF", "-mno-wavefrontsize64", "-fno-gpu-rdc",
-                           "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20"],
-        build_directory=os.path.join(TREE, "persist", "build"),
+                           "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20"] + os.environ.get("PM_FLAGS", "").split(),
+        build_directory=bdir,
         verbose=False,
     )
 
@@ -55,7 +57,7 @@ class PM:
         self.ws_d = e(self.s_d * M * D); self.cnt_d = z(D // 128)
         self.c_d = [e(1, M, D) for _ in blocks]
         self.dep = [z(2 + self.s_d) for _ in blocks]
-        self.queue = z(1); self.dummy = z(1)
+        self.queue = z(1); self.dummy = z(1); self.q2 = z(2)
         self.epoch = 0
         self.prefetch = args.prefetch
         self.order = args.order
@@ -78,7 +80,7 @@ class PM:
         else: l1, f1 = [], []
         cfg = [self.M, self.D, self.I, self.s_gu, self.ks_gu, self.s_d, self.ks_d, self.queue.data_ptr(), self.epoch,
                self.grid, self.prefetch, len(self.blocks), self.dummy.data_ptr(), 4,
-               self.trace.data_ptr() if getattr(self, "trace", None) is not None else 0, self.order, part, self.mode]
+               self.trace.data_ptr() if getattr(self, "trace", None) is not None else 0, self.order, part, self.mode, self.q2.data_ptr()]
         self.pmx.run(l0, f0, l1, f1, cfg)
         return self.c_d[-1]
 
@@ -172,9 +174,18 @@ def main():
             if args.parts:
                 pm, r = pms[0], rs[0]
                 pm.run(xin, r)
-                for part, name in ((1, "gate/up"), (2, "down")):
+                for part, name in ((1, "gate/up"), (2, "down"), (3, "gate/up pulled by persistent grid")):
                     tq, tqm = timeit(lambda: pm.run(xin, r, part), args.reps, args.inner)
                     print(f"    part {name}: plain grid of the same unit code {tq:7.1f} us (min {tqm:.1f})", flush=True)
+                # boundary + fill/drain of one gate/up launch: R passes in one persistent launch vs R launches
+                m0 = pm.mode
+                for R in (1, 2, 4):
+                    pm.mode = R
+                    tR, _ = timeit(lambda: pm.run(xin, r, 3), args.reps, args.inner)
+                    pm.mode = 1
+                    t1, _ = timeit(lambda: [pm.run(xin, r, 3) for _ in range(R)], args.reps, args.inner)
+                    print(f"    pgu x{R}: one launch {tR:7.1f} us, {R} launches {t1:7.1f} us -> per extra launch {(t1 - tR) / max(1, R - 1):5.1f} us", flush=True)
+                pm.mode = m0
                 # port kernels alone, for the same split config
                 b = chains[0][0]; mgu = b.mlp.multi_gu[0]
             if args.trace:

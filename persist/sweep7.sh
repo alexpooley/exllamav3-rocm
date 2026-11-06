@@ -1,0 +1,1 @@
+for v in "" _ni; do export PM_VARIANT=$v PM_FLAGS=; [ -n "$v" ] && PM_FLAGS=-DPM_UNIT_NOINLINE; for md in 0 7; do echo "== variant [$v] mode $md"; timeout -s KILL 120 python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid 288 --layers 3,7,11,15 --mode $md --parts 2>&1 | grep "per MLP\|part "; done; done

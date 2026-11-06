@@ -1,0 +1,1 @@
+for g in 192 288; do echo "== order 1 grid $g trace"; timeout -s KILL 120 python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid $g --order 1 --layers 3 --trace 2>&1 | grep "  L0\|per MLP"; done

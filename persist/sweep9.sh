@@ -1,0 +1,1 @@
+for g in 96 144 192 288 400 544 1000; do echo "== grid $g"; timeout -s KILL 120 python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid $g --layers 3,7,11,15 --rows 8 --parts 2>&1 | grep "persistent grid\|part gate/up: "; done

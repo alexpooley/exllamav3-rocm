@@ -1,0 +1,1 @@
+for g in 288 600; do echo "== mode 7 grid $g"; timeout -s KILL 120 python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid $g --layers 3 --rows 8 --mode 7 --trace --parts 2>&1 | grep "per MLP\|  L0 gate\|part gate"; done

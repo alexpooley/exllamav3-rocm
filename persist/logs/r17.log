@@ -1,0 +1,37 @@
+start 00:30:26
+== mode 0
+  M=1 chain 1: per MLP  base   176.5 us (min 174.6, again 177.5)  persistent   190.5 us (min 187.4)  floor 139.3 us (133.7 MB)  -> -8.0%  persistent 702 GB/s
+    part gate/up: plain grid of the same unit code   114.8 us (min 114.3)
+    part down: plain grid of the same unit code    52.8 us (min 52.6)
+    part gate/up pulled by persistent grid: plain grid of the same unit code   110.3 us (min 110.2)
+  M=8 chain 1: per MLP  base   235.2 us (min 233.1, again 235.6)  persistent   285.9 us (min 284.8)  floor 139.3 us (133.7 MB)  -> -21.6%  persistent 468 GB/s
+    part gate/up: plain grid of the same unit code   152.2 us (min 150.8)
+    part down: plain grid of the same unit code    82.3 us (min 80.6)
+    part gate/up pulled by persistent grid: plain grid of the same unit code   153.2 us (min 150.9)
+== mode 7
+    layer 3+1: bit-exact False  max|dd| 11.4  max|dr| 1.69  |d| 12
+    layer 7+1: bit-exact False  max|dd| 6.64  max|dr| 1.69  |d| 6.93
+    layer 11+1: bit-exact False  max|dd| 10.6  max|dr| 1.69  |d| 10.6
+    layer 15+1: bit-exact False  max|dd| 2.05  max|dr| 1.69  |d| 2.05
+  M=1 chain 1: per MLP  base   176.7 us (min 175.0, again 177.7)  persistent   123.9 us (min 122.8)  floor 139.3 us (133.7 MB)  -> +29.9%  persistent 1079 GB/s
+    part gate/up: plain grid of the same unit code   114.6 us (min 114.2)
+    part down: plain grid of the same unit code    52.8 us (min 52.5)
+    part gate/up pulled by persistent grid: plain grid of the same unit code   110.4 us (min 110.1)
+    layer 3+1: bit-exact False  max|dd| 13.3  max|dr| 2.09  |d| 13.3
+    layer 7+1: bit-exact False  max|dd| 8.75  max|dr| 2.09  |d| 8.75
+    layer 11+1: bit-exact False  max|dd| 16.5  max|dr| 2.09  |d| 16.5
+    layer 15+1: bit-exact False  max|dd| 2.75  max|dr| 2.09  |d| 2.75
+  M=8 chain 1: per MLP  base   235.5 us (min 233.1, again 235.5)  persistent   172.1 us (min 171.5)  floor 139.3 us (133.7 MB)  -> +26.9%  persistent 777 GB/s
+    part gate/up: plain grid of the same unit code   150.9 us (min 149.6)
+    part down: plain grid of the same unit code    81.0 us (min 79.9)
+    part gate/up pulled by persistent grid: plain grid of the same unit code   151.4 us (min 148.5)
+== trace
+  M=1 chain 1: per MLP  base   184.3 us (min 174.8, again 172.0)  persistent   183.8 us (min 182.7)  floor 139.3 us (133.7 MB)  -> +0.3%  persistent 727 GB/s
+    L0 norm     units    1  start     0.0..    0.0  end    10.9..   10.9 us  wait mean    0.0 max    0.0  body mean   10.9 min   10.9 max   10.9
+    L0 gate/up  units  544  start     0.0..   83.9  end    44.3..  128.2 us  wait mean    6.9 max   11.6  body mean   46.0 min   28.4 max   96.1
+    L0 down     units  320  start    83.9..  129.1  end   126.1..  166.5 us  wait mean   14.5 max   24.4  body mean   30.6 min   17.8 max   53.6
+  M=8 chain 1: per MLP  base   227.3 us (min 226.1, again 233.1)  persistent   273.1 us (min 271.4)  floor 139.3 us (133.7 MB)  -> -20.1%  persistent 490 GB/s
+    L0 norm     units    8  start     0.0..    0.1  end    11.9..   12.8 us  wait mean    0.0 max    0.0  body mean   12.2 min   11.8 max   12.8
+    L0 gate/up  units  544  start     0.0..  118.4  end    49.6..  208.2 us  wait mean    7.5 max   13.6  body mean   74.2 min   36.0 max  194.9
+    L0 down     units  320  start   118.4..  195.1  end   181.6..  288.3 us  wait mean   31.9 max   90.5  body mean   45.2 min   29.3 max   84.2
+exit 0 00:31:04

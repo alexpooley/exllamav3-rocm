@@ -1,0 +1,1 @@
+for g in 576 880 1200; do echo "== grid $g"; python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid $g --layers 3 --rows 8 --trace 2>&1 | grep "per MLP\|  L0\|bit-exact False"; done

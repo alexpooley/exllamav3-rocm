@@ -1,0 +1,1 @@
+for g in 288 384 576; do for pf in 0 1; do echo "== grid $g prefetch $pf"; python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid $g --prefetch $pf 2>&1 | grep "per MLP\|bit-exact False"; done; done

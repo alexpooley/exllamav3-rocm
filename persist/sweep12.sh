@@ -1,0 +1,1 @@
+for o in 0 1; do for g in 192 288; do for sp in "" "--gu-splits 4 --d-splits 17"; do echo "== order $o grid $g $sp"; timeout -s KILL 120 python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid $g --order $o $sp --layers 3,7,11,15 2>&1 | grep "per MLP"; done; done; done

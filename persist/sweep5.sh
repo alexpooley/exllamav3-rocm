@@ -1,0 +1,1 @@
+for md in 0 1 2 3 6 7; do echo "== mode $md"; python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid 288 --layers 3 --rows 8 --mode $md --trace 2>&1 | grep "per MLP\|  L0 gate\|  L0 down"; done

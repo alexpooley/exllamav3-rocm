@@ -1,0 +1,2 @@
+for v in "" _ib _kc _ibkc; do export PM_VARIANT=$v; case $v in _ib) PM_FLAGS=-DPM_IB_NOUNROLL;; _kc) PM_FLAGS=-DPM_KC_NOUNROLL;; _ibkc) PM_FLAGS="-DPM_KC_NOUNROLL -DPM_IB_NOUNROLL";; *) PM_FLAGS=;; esac; export PM_FLAGS
+for md in 0 7; do echo "== variant [$v] mode $md"; timeout -s KILL 120 python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid 288 --layers 3,7,11,15 --mode $md --parts 2>&1 | grep "per MLP\|persistent grid\|bit-exact False"; done; done

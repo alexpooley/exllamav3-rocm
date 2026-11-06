@@ -1,0 +1,26 @@
+start 00:43:01
+== mode 1 order 0 grid 192
+  M=1 chain 1: per MLP  base   176.9 us (min 174.9, again 177.6)  persistent   183.4 us (min 178.4)  floor 139.3 us (133.7 MB)  -> -3.7%  persistent 729 GB/s
+  M=8 chain 1: per MLP  base   235.4 us (min 235.2, again 235.6)  persistent   268.3 us (min 267.5)  floor 139.3 us (133.7 MB)  -> -14.0%  persistent 498 GB/s
+== mode 1 order 0 grid 288
+  M=1 chain 1: per MLP  base   176.8 us (min 175.0, again 177.7)  persistent   176.7 us (min 175.3)  floor 139.3 us (133.7 MB)  -> +0.0%  persistent 757 GB/s
+  M=8 chain 1: per MLP  base   236.2 us (min 235.4, again 235.5)  persistent   259.6 us (min 259.6)  floor 139.3 us (133.7 MB)  -> -9.9%  persistent 515 GB/s
+== mode 1 order 1 grid 192
+  M=1 chain 1: per MLP  base   176.7 us (min 175.4, again 178.0)  persistent   185.2 us (min 180.3)  floor 139.3 us (133.7 MB)  -> -4.8%  persistent 722 GB/s
+  M=8 chain 1: per MLP  base   235.7 us (min 235.4, again 235.6)  persistent   269.7 us (min 269.3)  floor 139.3 us (133.7 MB)  -> -14.4%  persistent 496 GB/s
+== mode 1 order 1 grid 288
+  M=1 chain 1: per MLP  base   177.2 us (min 175.3, again 177.9)  persistent   179.1 us (min 178.8)  floor 139.3 us (133.7 MB)  -> -1.1%  persistent 746 GB/s
+  M=8 chain 1: per MLP  base   236.1 us (min 235.3, again 235.9)  persistent   264.8 us (min 263.8)  floor 139.3 us (133.7 MB)  -> -12.2%  persistent 505 GB/s
+== mode 5 order 0 grid 192
+  M=1 chain 1: per MLP  base   177.7 us (min 175.4, again 177.9)  persistent   182.4 us (min 177.5)  floor 139.3 us (133.7 MB)  -> -2.6%  persistent 733 GB/s
+  M=8 chain 1: per MLP  base   235.6 us (min 233.3, again 235.9)  persistent   261.2 us (min 260.4)  floor 139.3 us (133.7 MB)  -> -10.8%  persistent 512 GB/s
+== mode 5 order 0 grid 288
+  M=1 chain 1: per MLP  base   177.5 us (min 175.6, again 177.6)  persistent   175.3 us (min 174.4)  floor 139.3 us (133.7 MB)  -> +1.3%  persistent 763 GB/s
+  M=8 chain 1: per MLP  base   236.1 us (min 235.2, again 236.2)  persistent   253.7 us (min 253.2)  floor 139.3 us (133.7 MB)  -> -7.4%  persistent 527 GB/s
+== mode 5 order 1 grid 192
+  M=1 chain 1: per MLP  base   177.4 us (min 175.7, again 177.8)  persistent   184.5 us (min 179.8)  floor 139.3 us (133.7 MB)  -> -4.0%  persistent 725 GB/s
+  M=8 chain 1: per MLP  base   236.4 us (min 234.4, again 236.4)  persistent   262.7 us (min 262.1)  floor 139.3 us (133.7 MB)  -> -11.1%  persistent 509 GB/s
+== mode 5 order 1 grid 288
+  M=1 chain 1: per MLP  base   178.0 us (min 175.8, again 177.8)  persistent   178.3 us (min 177.9)  floor 139.3 us (133.7 MB)  -> -0.2%  persistent 750 GB/s
+  M=8 chain 1: per MLP  base   236.1 us (min 235.0, again 236.3)  persistent   255.1 us (min 254.0)  floor 139.3 us (133.7 MB)  -> -8.1%  persistent 524 GB/s
+exit 0 00:44:44

@@ -1,0 +1,22 @@
+start 23:36:37
+[92mSuccessfully preprocessed all matching files.[0m
+ -- 64 blocks
+ -- M=1: s_gu 2 ks_gu 160, s_d 8 ks_d 136, occupancy 3/SM x 48 SM, grid 144
+ -- M=1: s_gu 2 ks_gu 160, s_d 8 ks_d 136, occupancy 3/SM x 48 SM, grid 144
+ -- M=1: s_gu 2 ks_gu 160, s_d 8 ks_d 136, occupancy 3/SM x 48 SM, grid 144
+ -- M=1: s_gu 2 ks_gu 160, s_d 8 ks_d 136, occupancy 3/SM x 48 SM, grid 144
+    layer 3+1: bit-exact True  max|dd| 0  max|dr| 0  |d| 12
+    layer 7+1: bit-exact True  max|dd| 0  max|dr| 0  |d| 6.93
+    layer 11+1: bit-exact True  max|dd| 0  max|dr| 0  |d| 10.6
+    layer 15+1: bit-exact True  max|dd| 0  max|dr| 0  |d| 2.05
+  M=1 chain 1: per MLP  base   177.1 us (min 175.3, again 177.8)  persistent   206.3 us (min 201.0)  floor 139.3 us (133.7 MB)  -> -16.5%  persistent 648 GB/s
+ -- M=8: s_gu 2 ks_gu 160, s_d 8 ks_d 136, occupancy 3/SM x 48 SM, grid 144
+ -- M=8: s_gu 2 ks_gu 160, s_d 8 ks_d 136, occupancy 3/SM x 48 SM, grid 144
+ -- M=8: s_gu 2 ks_gu 160, s_d 8 ks_d 136, occupancy 3/SM x 48 SM, grid 144
+ -- M=8: s_gu 2 ks_gu 160, s_d 8 ks_d 136, occupancy 3/SM x 48 SM, grid 144
+    layer 3+1: bit-exact True  max|dd| 0  max|dr| 0  |d| 13.3
+    layer 7+1: bit-exact True  max|dd| 0  max|dr| 0  |d| 8.75
+    layer 11+1: bit-exact True  max|dd| 0  max|dr| 0  |d| 16.5
+    layer 15+1: bit-exact True  max|dd| 0  max|dr| 0  |d| 2.75
+  M=8 chain 1: per MLP  base   235.7 us (min 231.7, again 236.5)  persistent   329.3 us (min 328.6)  floor 139.3 us (133.7 MB)  -> -39.7%  persistent 406 GB/s
+exit 0 23:36:51

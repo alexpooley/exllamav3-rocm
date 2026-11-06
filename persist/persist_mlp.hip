@@ -74,7 +74,11 @@ __device__ __forceinline__ void wait_ge(int* c, int target)
 
 __device__ __forceinline__ void signal(int* c)
 {
-    __threadfence();
+#ifdef PM_FULL_FENCE
+    __threadfence();             // seq_cst agent fence: also invalidates L0 / GL1 (GL1 is shared by the shader array)
+#else
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");   // stores done and visible at L2, no invalidate
+#endif
     __syncthreads();
     if (threadIdx.x == 0) __hip_atomic_fetch_add(c, 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
@@ -97,10 +101,21 @@ __device__ __forceinline__ void l2_prefetch(const uint32_t* B, int n_stride, int
     if (acc == 0x9e3779b9u) *dummy = acc;
 }
 
+__device__ __forceinline__ uint64_t uniform_ptr(uint64_t p)
+{
+    const uint32_t lo = __builtin_amdgcn_readfirstlane((uint32_t) p);
+    const uint32_t hi = __builtin_amdgcn_readfirstlane((uint32_t) (p >> 32));
+    return ((uint64_t) hi << 32) | lo;
+}
+
 // exl3_rdna3_unit (exl3_rdna3_kernel_hip.cuh), RAW path only, with the shared memory passed in and
 // wait() called once the first weight prefetch ring is in flight, before any read of xh / xcs
 template <int bits, int MR, bool c_fp32, typename W>
+#ifdef PM_UNIT_NOINLINE
+__device__ __attribute__((noinline)) void unit
+#else
 __device__ __forceinline__ void unit
+#endif
 (
     const int e, const int rc, const int group, const int split, const int row_chunks,
     const uint2* __restrict__ xh, const uint32_t* __restrict__ B, void* __restrict__ C,
@@ -114,11 +129,19 @@ __device__ __forceinline__ void unit
     constexpr bool half_k = false;
     constexpr int cb = 2;
     int n_stride = size_n;
+    #define PM_U(x) x = (decltype(x)) uniform_ptr((uint64_t) (x))
+    PM_U(xh); PM_U(B); PM_U(C); PM_U(counters); PM_U(xcs); PM_U(ws); PM_U(svh);
+    size_m = __builtin_amdgcn_readfirstlane(size_m); size_k = __builtin_amdgcn_readfirstlane(size_k);
+    size_n = __builtin_amdgcn_readfirstlane(size_n); splits = __builtin_amdgcn_readfirstlane(splits);
+    ks_per_split = __builtin_amdgcn_readfirstlane(ks_per_split);
     if (mt.b)
     {
         const int src = mt.src ? mt.src[e] : e;
-        B = (const uint32_t*) mt.b[e];
-        svh = (const half*) mt.svh[e];
+        // Table loads inside the persistent loop come back in VGPRs (vector loads: the loop also stores);
+        // without readfirstlane the buffer resource is rebuilt with v_readfirstlane in the hot loop (32 per
+        // k-slice step), which cost 25% at M = 8
+        B = (const uint32_t*) uniform_ptr(mt.b[e]);
+        svh = (const half*) uniform_ptr(mt.svh[e]);
         if (mt.c) C = (void*) mt.c[e];
         else C = (void*) ((char*) C + (size_t) e * size_m * size_n * (c_fp32 ? 4 : 2));
         if (mt.n_stride) n_stride = mt.n_stride[e];
@@ -162,6 +185,9 @@ __device__ __forceinline__ void unit
             for (int a = 0; a < NACC; ++a) acc[m][j][a] = 0.0f;
 
     bool first = true;
+#ifdef PM_KC_NOUNROLL
+    #pragma clang loop unroll(disable)
+#endif
     for (int kc0 = ks_begin; kc0 < ks_end; kc0 += KCS)
     {
         const int nk = min(ks_end - kc0, KCS);
@@ -226,6 +252,9 @@ __device__ __forceinline__ void unit
         }
         __syncthreads();
 
+#ifdef PM_IB_NOUNROLL
+        #pragma clang loop unroll(disable)
+#endif
         for (int ib = 0; ib < nk; ib += PF)
         {
             #pragma unroll
@@ -500,12 +529,24 @@ void persist_mlp_kernel(Params p)
     const unsigned base = (p.epoch - 1u) * (total + gridDim.x);
     const int ep = (int) p.epoch;
 
+#if defined(PM_PRIO) && PM_PRIO == 1
+    // Wave arbitration is oldest-first: in a persistent grid the late-placed workgroups starve for the
+    // whole launch. Give them the higher priority instead
+    switch ((blockIdx.x * 4) / gridDim.x)
+    {
+        case 0: break;
+        case 1: __builtin_amdgcn_s_setprio(1); break;
+        case 2: __builtin_amdgcn_s_setprio(2); break;
+        default: __builtin_amdgcn_s_setprio(3); break;
+    }
+#endif
+
     while (true)
     {
         __syncthreads();
         if (threadIdx.x == 0) s_unit = atomicAdd(p.queue, 1u) - base;
         __syncthreads();
-        unsigned u = s_unit;
+        unsigned u = __builtin_amdgcn_readfirstlane(s_unit);   // uniform: keeps B / rsrc in SGPRs (else waterfall loops)
         const unsigned ug = u;
         if (p.trace && threadIdx.x == 0 && u < total) { p.trace[4 * u] = __builtin_readsteadycounter(); p.trace[4 * u + 1] = 0; p.trace[4 * u + 3] = blockIdx.x; }
         if (u >= total) break;
@@ -594,6 +635,39 @@ void part_kernel(Params p)
     }
 }
 
+// A/B control: gate/up units only, pulled from a queue by a persistent grid, in a kernel that contains
+// nothing else (separates the codegen of the combined kernel from the pull pattern). q[0] queue,
+// q[1] exit count; the last workgroup out resets both
+template <int bits, int MR>
+__global__ __launch_bounds__(256)
+void pgu_kernel(Params p, unsigned* q)
+{
+    constexpr int KCS = XS_BYTES / (MR * 2) / 16 / 8 * 8;
+    __shared__ uint2 xs[MR * KCS * 4];
+    __shared__ float red[MR < 2 ? 2 : MR][128];
+    __shared__ float xsum[MR];
+    __shared__ int last_flag;
+    __shared__ unsigned s_unit;
+    const Layer& L = p.L[0];
+    const int G_gu = p.I / 128;
+    const unsigned n1 = G_gu * 2 * p.s_gu;
+    const unsigned n = n1 * (p.mode > 1 ? p.mode : 1);   // mode = R: the unit list R times (timing only)
+    auto w = [&] (const uint32_t*, int, int, int, int) {};
+    while (true)
+    {
+        __syncthreads();
+        if (threadIdx.x == 0) s_unit = atomicAdd(q, 1u);
+        __syncthreads();
+        unsigned u = __builtin_amdgcn_readfirstlane(s_unit);
+        if (u >= n) break;
+        u %= n1;
+        const int g = u % G_gu, s = (u / G_gu) % p.s_gu, e = u / (G_gu * p.s_gu);
+        unit<bits, MR, false>(e, 0, g, s, 1, L.xh_gu, nullptr, L.c_gu, p.M, p.D, p.I, L.cnt_gu, L.xcs_gu, L.ws_gu,
+                              nullptr, p.s_gu, p.ks_gu, L.mt, xs, red, xsum, last_flag, w);
+    }
+    if (threadIdx.x == 0 && atomicAdd(q + 1, 1u) == gridDim.x - 1) { q[0] = 0; q[1] = 0; }
+}
+
 }  // namespace pm
 
 // Layer pointer list order (int64): xin, resid, nw, gu_suh_tab, xh_gu, xcs_gu, b_tab, svh_tab, c_gu, ws_gu,
@@ -658,6 +732,13 @@ void run(std::vector<int64_t> l0, std::vector<double> f0, std::vector<int64_t> l
     const int partsel = cfg.size() > 16 ? (int) cfg[16] : 0;
     if (partsel)
     {
+        if (partsel == 3)
+        {
+            unsigned* q = (unsigned*) cfg[18];
+            if (p.M == 1) hipLaunchKernelGGL((pm::pgu_kernel<4, 1>), dim3(grid), dim3(256), 0, stream, p, q);
+            else hipLaunchKernelGGL((pm::pgu_kernel<4, 8>), dim3(grid), dim3(256), 0, stream, p, q);
+            return;
+        }
         const int n = partsel == 1 ? p.I / 128 * 2 * p.s_gu : p.D / 128 * p.s_d;
         if (p.M == 1) { if (partsel == 1) hipLaunchKernelGGL((pm::part_kernel<4, 1, 1>), dim3(n), dim3(256), 0, stream, p);
                         else hipLaunchKernelGGL((pm::part_kernel<4, 1, 2>), dim3(n), dim3(256), 0, stream, p); }

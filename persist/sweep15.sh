@@ -1,0 +1,1 @@
+for md in 1 5; do for o in 0 1; do for g in 192 288; do echo "== mode $md order $o grid $g"; timeout -s KILL 120 python pm_bench.py -m ~/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw --grid $g --order $o --mode $md --layers 3,7,11,15 2>&1 | grep "per MLP"; done; done; done
