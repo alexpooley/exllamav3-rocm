@@ -107,6 +107,106 @@ __device__ __forceinline__ uint32_t mul1_mul_half(uint32_t y)
 }
 #endif
 
+// 4-bit decode codebook, timing experiment only (branch q27-cb; any value but 0 gives wrong weights).
+// 0 mul1 (production), 1 tab10_9e37, 2 tab8_9e37, 3 mad16sad_c26b_fed91b48, 4 tab8 with the 8-bit code read as
+// an fp16 denormal (no v_or), 5 tab8 with an fp16 table (ds_load_u16_d16, 512 B), 9 mul1 with a changed
+// multiplier (same instructions as 0, wrong values: control for value-dependent costs such as GDN replay).
+// 6 / 7: tab8 / tab10 with two plain ds_load_u8 per pair merged by one v_perm_b32 (fp16 denormal codes): the
+// d16 loads of 1, 2, 4, 5 make each _hi load wait for its low half (s_waitcnt lgkmcnt per pair).
+// 8: tab8 with an fp16 table (0x6400 | code, 512 B), two plain ds_load_u16 + v_perm_b32.
+// Set in exl3_cb4_local.h (untracked, optional) or with -DEXL3_CB4=N
+#if __has_include("exl3_cb4_local.h")
+#include "exl3_cb4_local.h"
+#endif
+#ifndef EXL3_CB4
+#define EXL3_CB4 0
+#endif
+#define EXL3_CB4_TAB (EXL3_CB4 == 1 || EXL3_CB4 == 2 || EXL3_CB4 == 4 || EXL3_CB4 == 5 || EXL3_CB4 == 6 || EXL3_CB4 == 7 || EXL3_CB4 == 8)
+#define EXL3_CB4_T16 (EXL3_CB4 == 5 || EXL3_CB4 == 8)
+constexpr int EXL3_CB4_TBITS = (EXL3_CB4 == 1 || EXL3_CB4 == 7) ? 10 : 8;            // table index bits
+constexpr int EXL3_CB4_TBYTES = EXL3_CB4_TAB ? (EXL3_CB4_T16 ? 512 : (1 << EXL3_CB4_TBITS)) : 4;
+
+// v_pk_mul_lo_u16 of both 16-bit halves of y by 0x9E37: hashes of the two windows in y
+__device__ __forceinline__ uint32_t cb4_hash2(uint32_t y)
+{
+    uint32_t t;
+    asm ("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(t) : "v"(y), "s"(0x9e379e37u));
+    return t;
+}
+
+// Table lookup of two hashes (index = top TBITS bits of each 16-bit half) into one packed half2 raw value:
+// ds_load_u8_d16 + ds_load_u8_d16_hi (or u16 for the fp16 table)
+template <int H0, int H1>
+__device__ __forceinline__ uint32_t cb4_tab_pair(const uint8_t* tab, uint32_t p0, uint32_t p1)
+{
+    constexpr int S = 16 - EXL3_CB4_TBITS;
+    constexpr uint32_t MSK = (1u << EXL3_CB4_TBITS) - 1;
+#ifndef CB4_LANEIDX
+    const uint32_t i0 = (p0 >> (16 * H0 + S)) & MSK;
+    const uint32_t i1 = (p1 >> (16 * H1 + S)) & MSK;
+#else
+    // kbench diagnostic: each lane reads its own dword (bank) of the table, same instruction count, no conflicts
+    const uint32_t ln = (threadIdx.x & 31) * 4 + (CB4_LANEIDX ? 128 * ((threadIdx.x >> 5) & 1) : 0);
+    const uint32_t i0 = (ln + ((p0 >> (16 * H0 + S)) & 3)) & MSK;
+    const uint32_t i1 = (ln + ((p1 >> (16 * H1 + S)) & 3)) & MSK;
+#endif
+    typedef unsigned short us2 __attribute__((ext_vector_type(2)));
+    us2 v;
+    if constexpr (EXL3_CB4 == 8)
+    {
+        const uint16_t* t16 = (const uint16_t*) tab;
+        const uint32_t a = t16[i0], b = t16[i1];
+        return __builtin_amdgcn_perm(b, a, 0x05040100u);
+    }
+    else if constexpr (EXL3_CB4 == 6 || EXL3_CB4 == 7)
+    {
+        const uint32_t a = tab[i0], b = tab[i1];
+        return __builtin_amdgcn_perm(b, a, 0x0c040c00u);
+    }
+    else if constexpr (EXL3_CB4 == 5)
+    {
+        const uint16_t* t16 = (const uint16_t*) tab;
+        v.x = t16[i0]; v.y = t16[i1];
+        return __builtin_bit_cast(uint32_t, v);
+    }
+    else
+    {
+        v.x = tab[i0]; v.y = tab[i1];
+        const uint32_t r = __builtin_bit_cast(uint32_t, v);
+        if constexpr (EXL3_CB4 == 4) return r;   // fp16 denormal = code * 2^-24
+        else return r | 0x64006400u;              // fp16 1024 + code
+    }
+}
+
+// mad16sad: s * 0xC26B + 0xFED91B48 (mod 2^32) for the window in half H of y, one v_mad_u32_u16
+template <int H>
+__device__ __forceinline__ uint32_t mad16_half(uint32_t y)
+{
+    uint32_t r;
+    if constexpr (H) asm ("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(r) : "v"(y), "s"(0xc26bu), "s"(0xfed91b48u));
+    else             asm ("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(r) : "v"(y), "s"(0xc26bu), "s"(0xfed91b48u));
+    return r;
+}
+
+// mul1 decode with a different low multiplier (control variant 9): same instructions, wrong values
+template <int H>
+__device__ __forceinline__ uint32_t mul1x_mul_half(uint32_t y)
+{
+    uint32_t t, r;
+    const uint32_t chi = 0x83dc0000u, clo = 0xd12fu;
+    if constexpr (H)
+    {
+        asm ("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(t) : "v"(y), "s"(chi));
+        asm ("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(r) : "v"(y), "s"(clo), "v"(t));
+    }
+    else
+    {
+        asm ("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(t) : "v"(y), "s"(chi));
+        asm ("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(r) : "v"(y), "s"(clo), "v"(t));
+    }
+    return r;
+}
+
 // fp16 raw codebook pair from two products (see mul1_raw_pair)
 __device__ __forceinline__ uint32_t mul1_raw_pair_p(uint32_t p0, uint32_t p1)
 {
@@ -401,6 +501,14 @@ __device__ __forceinline__ void exl3_rdna3_unit
     float (*red)[128] = reinterpret_cast<float (*)[128]>(xs);
     __shared__ float xsum[MR];
     __shared__ int last_flag;
+    // 4-bit table codebook (EXL3_CB4 experiment): filled with dummy codes before the first lds_barrier
+    constexpr bool CBTAB = EXL3_CB4_TAB && RAW && bits == 4;
+    __shared__ __attribute__((aligned(16))) uint8_t cbtab[CBTAB ? EXL3_CB4_TBYTES : 4];
+    if constexpr (CBTAB)
+    {
+        for (int i = threadIdx.x; i < EXL3_CB4_TBYTES / 4; i += THREADS)
+            ((uint32_t*) cbtab)[i] = ((uint32_t) i * 0x9e3779b9u) & (EXL3_CB4_T16 ? 0x00ff00ffu : 0xffffffffu);
+    }
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -589,10 +697,30 @@ __device__ __forceinline__ void exl3_rdna3_unit
                             const uint32_t y8 = __builtin_amdgcn_alignbit(a, b, 8);
                             const uint32_t y12 = __builtin_amdgcn_alignbit(a, b, 12);
                             refill();
+#if EXL3_CB4_TAB
+                            // One v_pk_mul_lo_u16 hashes both windows of a funnel word, then two LDS byte loads
+                            const uint32_t p12 = cb4_hash2(y12), p8 = cb4_hash2(y8);
+                            const uint32_t p4 = cb4_hash2(y4), p0 = cb4_hash2(b);
+                            w00 = cb4_tab_pair<1, 1>(cbtab, p12, p8);
+                            w01 = cb4_tab_pair<1, 1>(cbtab, p4, p0);
+                            w10 = cb4_tab_pair<0, 0>(cbtab, p12, p8);
+                            w11 = cb4_tab_pair<0, 0>(cbtab, p4, p0);
+#elif EXL3_CB4 == 3
+                            w00 = mul1_raw_pair_p(mad16_half<1>(y12), mad16_half<1>(y8));
+                            w01 = mul1_raw_pair_p(mad16_half<1>(y4), mad16_half<1>(b));
+                            w10 = mul1_raw_pair_p(mad16_half<0>(y12), mad16_half<0>(y8));
+                            w11 = mul1_raw_pair_p(mad16_half<0>(y4), mad16_half<0>(b));
+#elif EXL3_CB4 == 9
+                            w00 = mul1_raw_pair_p(mul1x_mul_half<1>(y12), mul1x_mul_half<1>(y8));
+                            w01 = mul1_raw_pair_p(mul1x_mul_half<1>(y4), mul1x_mul_half<1>(b));
+                            w10 = mul1_raw_pair_p(mul1x_mul_half<0>(y12), mul1x_mul_half<0>(y8));
+                            w11 = mul1_raw_pair_p(mul1x_mul_half<0>(y4), mul1x_mul_half<0>(b));
+#else
                             w00 = mul1_raw_pair_p(mul1_mul_half<1>(y12), mul1_mul_half<1>(y8));   // w0, w1
                             w01 = mul1_raw_pair_p(mul1_mul_half<1>(y4), mul1_mul_half<1>(b));     // w2, w3
                             w10 = mul1_raw_pair_p(mul1_mul_half<0>(y12), mul1_mul_half<0>(y8));   // w4, w5
                             w11 = mul1_raw_pair_p(mul1_mul_half<0>(y4), mul1_mul_half<0>(b));     // w6, w7
+#endif
                         }
                         else
                         {
