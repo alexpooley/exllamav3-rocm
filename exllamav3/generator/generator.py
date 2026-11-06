@@ -19,6 +19,13 @@ _presample_enable = os.environ.get("EXL3_PRESAMPLE", "1") != "0"
 _adapt_window_enable = os.environ.get("EXL3_ADAPT_WINDOW", "0") == "1"   # off: +4% prose, -3% code
 from .adaptive_window import AdaptiveWindow
 _draft_nb_enable = os.environ.get("EXL3_DRAFT_NB", "1") != "0"
+# Early accept (DFlash, presampled windows): after the verify readback, decide each job's accepted length
+# from the host copies of the draft and the samples, and launch the recurrent-state rewind and the draft
+# K/V update before the per-token bookkeeping (receive_sample), so the GPU does not idle while the host
+# streams tokens. EXL3_PREDRAFT also launches the next round's drafter forward there. Both are exact:
+# the bookkeeping loop still runs and must reach the same accepted lengths
+_early_accept_enable = os.environ.get("EXL3_EARLY_ACCEPT", "1") != "0"
+_predraft_enable = os.environ.get("EXL3_PREDRAFT", "1") != "0"
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -196,6 +203,9 @@ class Generator:
 
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
+        self._predraft = None
+        self.predraft_discarded = 0
+        self.early_accept_rounds = 0
         self.staging_buffers = {}
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
@@ -203,6 +213,11 @@ class Generator:
         # into draft_ids_pinned
         if draft_model or ngram_match_min:
             self.draft_input_ids_pinned = torch.empty(
+                (max_batch_size, 1),
+                dtype = torch.long,
+                pin_memory = True
+            )
+            self.predraft_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
                 pin_memory = True
@@ -817,6 +832,48 @@ class Generator:
 
 
     # TODO: Refactor, share code with other draft fns
+    def _launch_dflash_draft(self, block_index_tensors, kv_positions, input_ids_list, max_seq_len, prefix, ids_pinned):
+        """
+        Launch the DFlash drafter forward and the selector for one block per row: row r has cache length
+        kv_positions[r], page table block_index_tensors[r] and anchor id input_ids_list[r] (host, (1, 1)).
+        Returns (drafted block ids on the device, (bsz, block) [anchor, path...], params). Staging buffers are
+        named by prefix so an early launch never shares pinned memory with a regular one.
+        """
+        batch_size = len(kv_positions)
+        # Create block index table for batch
+        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging(prefix + "_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging(prefix + "_cache_seqlens", batch_size)
+        for batch, (bi, kv) in enumerate(zip(block_index_tensors, kv_positions)):
+            seq_block_index = bi[:, :max_pages_batch]
+            block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+            cache_seqlens[batch] = kv
+
+        # Collect input IDs
+        batch_ids = ids_pinned[:batch_size, :]
+        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
+
+        # Run draft model
+        params = {
+            "attn_mode": "flash_attn",
+            "block_table": block_index,
+            "cache": self.draft_cache,
+            "cache_seqlens": cache_seqlens,
+        }
+        if self.draft_calibrator is not None:
+            params["export_draft_conf"] = True
+        out_state = self.draft_model.forward(
+            input_ids = batch_ids,
+            params = params,
+        )
+        new_ids = self.draft_model.sample_from_state(out_state, params)
+        return new_ids, params
+
+
     def iterate_draftmodel_dflash_gen(self, results: list):
 
         self._draft_conf_round = None
@@ -840,49 +897,34 @@ class Generator:
         if self.adaptive_window is not None and _adapt_window_enable:
             window = self.adaptive_window.choose()
 
-        # Create block index table for batch
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
-        # pageable copies; the draft's own buffers, since the target's are still in flight
-        max_pages_batch = (max_pages_batch + 15) // 16 * 16
-        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
-        block_index.zero_()
-        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
-        batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                batch += 1
-
-        # Collect input IDs
-        input_ids_list = []
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            if job.time_first_token is None:
-                cuda_sync_active()
-                job.time_first_token = time.time()
-            job_ids = job.get_input_ids_list()
-            input_ids_list += job_ids
-        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
-        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
-
-        # Run draft model
-        params = {
-            "attn_mode": "flash_attn",
-            "block_table": block_index,
-            "cache": self.draft_cache,
-            "cache_seqlens": cache_seqlens,
-        }
-        if self.draft_calibrator is not None:
-            params["export_draft_conf"] = True
-        out_state = self.draft_model.forward(
-            input_ids = batch_ids,
-            params = params,
-        )
-        new_ids = self.draft_model.sample_from_state(out_state, params)
+        # A drafter forward launched early by the previous round (EXL3_PREDRAFT) is used if the jobs reached
+        # exactly the state it was launched for; otherwise it is discarded and the drafter runs here
+        pre = self._predraft
+        self._predraft = None
+        rows = [job for job in self.active_jobs if job.is_prefill_done()]
+        if pre is not None and pre["jobs"] == rows and all(
+            job.sequences[0].kv_position == kv and len(job.sequences[0].sequence_ids) == kv + 1 and
+            torch.equal(job.sequences[0].block_index_tensor[:, :bi.shape[-1]], bi)
+            for job, kv, bi in zip(rows, pre["kv"], pre["bi"])
+        ):
+            new_ids, params = pre["new_ids"], pre["params"]
+            if pre["max_seq_len"] != max_seq_len:
+                raise RuntimeError("predraft: block table width mismatch")
+        else:
+            if pre is not None:
+                self.predraft_discarded += 1
+            for job in rows:
+                if job.time_first_token is None:
+                    cuda_sync_active()
+                    job.time_first_token = time.time()
+            new_ids, params = self._launch_dflash_draft(
+                [seq.block_index_tensor for job in rows for seq in job.sequences],
+                [seq.kv_position for job in rows for seq in job.sequences],
+                [ids for job in rows for ids in job.get_input_ids_list()],
+                max_seq_len,
+                "draft",
+                self.draft_input_ids_pinned,
+            )
 
         # Draft models with a confidence head cap the usable draft length per round;
         # 0 means no draft position cleared the threshold, so skip drafting entirely
@@ -963,6 +1005,87 @@ class Generator:
             buf = torch.zeros(shape, dtype = dtype, pin_memory = True)
             self.staging_buffers[key] = buf
         return buf[:rows]
+
+
+    def _early_accept(self, presampled, draft_tokens, batch_states, logit_mapping, window,
+                      p_export_states, block_index, p_cache_seqlens, launched):
+        """
+        Decide every job's accepted length from the host copies of the drafts and the presampled tokens, and
+        launch the recurrent rewinds and the draft K/V update in the order the bookkeeping loop would. Returns
+        None (nothing launched) unless every job is single-sequence, presampled, has no banned strings, and
+        cannot hit max_new_tokens, a stop token, a requeue or a recurrent checkpoint inside the accepted span.
+        """
+        jobs = []
+        lengths = []
+        dt = draft_tokens.tolist()
+        row = 0
+        for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+            if a == b: continue
+            s_ = presampled.get(idx)
+            if s_ is None or len(job.sequences) != 1 or job.banned_strings or job.checkpoint is not None:
+                return None
+            s_ = s_[0].tolist()
+            d_ = dt[row]
+            acc = window
+            for i in range(window):
+                if d_[i] != s_[i]:
+                    acc = i
+                    break
+            nt = job.new_tokens
+            if nt + acc + 1 >= job.max_new_tokens:
+                return None
+            if nt + acc + 1 > job.max_rq_tokens - self.num_draft_tokens:
+                return None
+            if any(t in job.stop_tokens for t in s_[:acc + 1]):
+                return None
+            if batch_states is not None:
+                seq = job.sequences[0]
+                base = seq.kv_position - job.cached_pages * PAGE_SIZE
+                interval = self.recurrent_checkpoint_interval
+                if any((base + i + 1) % interval == 0 for i in range(min(acc, window - 1) + 1)):
+                    return None
+            jobs.append(job)
+            lengths.append(acc + 1)
+            row += 1
+
+        # Same launches, same order as the loop: rewind each job, then one draft K/V update
+        if batch_states is not None:
+            for j_, acc1 in enumerate(lengths):
+                batch_states[j_].rewind(window + 1 - acc1)
+        self.draft_model.update_kv_from_target(
+            target_hidden = p_export_states,
+            cache = self.draft_cache,
+            lengths = lengths,
+            params = {
+                "block_table": block_index,
+                "cache_seqlens": p_cache_seqlens,
+            }
+        )
+        self.early_accept_rounds += 1
+
+        # Next round's drafter forward, from the state the loop is about to reach: cache length + accepted + 1,
+        # anchor = the sample after the last accepted draft
+        if _predraft_enable:
+            kvs = [job.sequences[0].kv_position + acc1 for job, acc1 in zip(jobs, lengths)]
+            anchors = [presampled[idx][:, acc1 - 1:acc1] for (idx, _), acc1 in zip(launched, lengths)]
+            max_seq_len = max(
+                max(kv + 1 + self.num_draft_tokens + 1, kv + 1 + self.draft_model.config.block_size + 1)
+                for kv in kvs
+            )
+            max_pages = ((max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE + 15) // 16 * 16
+            bis = [job.sequences[0].block_index_tensor[:, :max_pages] for job in jobs]
+            new_ids, params = self._launch_dflash_draft(
+                bis, kvs, anchors, max_seq_len, "predraft", self.predraft_ids_pinned,
+            )
+            self._predraft = {
+                "jobs": jobs,
+                "kv": kvs,
+                "bi": [bi.clone() for bi in bis],
+                "new_ids": new_ids,
+                "params": params,
+                "max_seq_len": max_seq_len,
+            }
+        return {"jobs": jobs, "lengths": lengths}
 
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
@@ -1099,6 +1222,7 @@ class Generator:
         requeuing_jobs = []
         accepted_lengths = []
         rewound_jobs = set()
+        early = None
         j = 0
 
         # Reject the trailing draft positions after the last accepted token at index i: count them, roll back the
@@ -1109,8 +1233,8 @@ class Generator:
                 return 0
             job_.rejected_draft_tokens += num_rejected
 
-            # Rewind recurrent states
-            if batch_states_ is not None:
+            # Rewind recurrent states (already launched by an early accept)
+            if batch_states_ is not None and early is None:
                 batch_states_[j_].rewind(num_rejected)
 
             # Rewind cache position (draft model cache layout is always the same as target)
@@ -1196,6 +1320,16 @@ class Generator:
                     torch.cuda.synchronize(batch_logits.device)
                     for k, (idx, _) in enumerate(launched):
                         presampled[idx] = staging[k:k + 1].clone()
+
+            # Early accept: when every job's window was presampled and nothing inside the window can end,
+            # requeue or checkpoint a job, the accepted length is the first draft/sample mismatch. Launch the
+            # state rewind and the draft K/V update now, and optionally the next drafter forward
+            early = None
+            if presampled and _early_accept_enable and self.dflash_draft and self.draft_calibrator is None:
+                early = self._early_accept(
+                    presampled, draft_tokens, batch_states, logit_mapping, batch_logits.shape[1] - 1,
+                    p_export_states, block_index, p_cache_seqlens, launched,
+                )
 
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
@@ -1293,7 +1427,7 @@ class Generator:
                             job.prepare_sampling_past_ids()
 
                 # Make sure outgoing state is valid if entire draft was accepted
-                if batch_states and draft_tokens is not None and rejected == 0:
+                if batch_states and draft_tokens is not None and rejected == 0 and early is None:
                     batch_states[j].rewind(0)
 
                 # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
@@ -1336,9 +1470,19 @@ class Generator:
                     cal.add_label(conf[a].item(), ids_full[a].item() == tail)
             cal.decay_step()
 
+        # An early accept predicted every accepted length; a job that ended inside the window (stop string, loop
+        # detector) may stop short, and its state is released below. Anything else is a logic error
+        if early is not None:
+            done = set(id(x) for x in completed_jobs)
+            for job, a_len, p_len in zip(early["jobs"], accepted_lengths, early["lengths"]):
+                if a_len != p_len and id(job) not in done:
+                    raise RuntimeError(f"early accept: predicted length {p_len}, loop accepted {a_len}")
+                if id(job) in done:
+                    self._predraft = None
+
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
-        if self.dflash_draft:
+        if self.dflash_draft and early is None:
             self.draft_model.update_kv_from_target(
                 target_hidden = p_export_states,
                 cache = self.draft_cache,
