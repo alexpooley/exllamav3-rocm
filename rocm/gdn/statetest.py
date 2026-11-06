@@ -9,6 +9,8 @@ def main():
     p = argparse.ArgumentParser(allow_abbrev=False)
     model_init.add_args(p, cache=True, add_draft_model_args=True)
     p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--dump", default=None, help="write sha1 of every logits/state/conv result (both modes) to this json")
+    p.add_argument("--ref", default=None, help="compare against a --dump from another build")
     args = p.parse_args()
     with torch.inference_mode():
         model, config, cache, tok = model_init.init(args)[:4]
@@ -32,6 +34,9 @@ def main():
             torch.cuda.synchronize()
             return lg.clone(), [(l.recurrent_state[0, 0].clone(), l.conv_state[0, :, :4].clone()) for l in layers], lm
         bad = 0
+        import hashlib, json
+        def h(t): return hashlib.sha1(t.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+        digests = {}
         for rep in range(args.reps):
             for r in range(M):
                 la, sa, ma = run(0, r)
@@ -42,7 +47,24 @@ def main():
                 lgq = torch.equal(la, lb)
                 ok = st == 0 and cv == 0 and lgq and ma is False and mb is True
                 bad += not ok
+                for tag, lg, ss in (("legacy", la, sa), ("log", lb, sb)):
+                    digests[f"{rep}:{r}:{tag}"] = [h(lg)] + [h(x[0]) for x in ss] + [h(x[1]) for x in ss]
                 print(f"rep {rep} rejected {r}: log_mode {ma}/{mb} state layers differing {st}/{len(layers)} (max abs {md:.3g}) conv {cv} logits equal {lgq} {'OK' if ok else 'FAIL'}", flush=True)
+        for m1 in (1, 3):   # no-history decode / short window
+            for l, (a, c) in zip(layers, s0):
+                l.recurrent_state[0, 0].copy_(a); l.conv_state[0].copy_(c)
+            rs[0].position = P; rs[0].last_history = 0
+            lg = model.forward(input_ids=ids[:, P:P + m1], params=dict(base, past_len=P, recurrent_states=rs, recurrent_history=False))
+            torch.cuda.synchronize()
+            digests[f"m{m1}"] = [h(lg)] + [h(l.recurrent_state[0, 0]) for l in layers]
+        rs[0].position = P; rs[0].last_history = 0
         print("ALL EXACT" if bad == 0 else f"FAILURES {bad}")
+        if args.dump: json.dump(digests, open(args.dump, "w"))
+        if args.ref:
+            ref = json.load(open(args.ref)); nd = 0
+            for k, v in digests.items():
+                if k in ref and ref[k] != v:
+                    nd += 1; print("vs ref DIFF", k, "items differing", sum(x != y for x, y in zip(v, ref[k])))
+            print("VS REF EXACT" if nd == 0 else f"VS REF DIFFS {nd}", "compared", sum(k in ref for k in digests))
 if __name__ == "__main__":
     main()
