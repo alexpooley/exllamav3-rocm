@@ -1,0 +1,7 @@
+04:29:26 dh4 tree /home/alex/code/exl3/wt-q27serve 0e35e66 env: EXL3_DRAFT_HEAD=/home/alex/code/exl3/models/work-dh4/lm_head-4bpw.safetensors EXL3_EXPANDABLE_SEGMENTS=0 EXL3_KVPOOL=/dev/shm/xtx-kv-test EXL3_KVPOOL_GB=8 EXL3_NOGRAPH=mlp,gdn EXL3_RCPOOL_GB=4 
+04:29:37 loaded
+vram_after_load_mb 
+vram_peak_mb  of 
+04:35:27 speed done
+rss_gb 13.1
+04:35:30 DONE

@@ -1,0 +1,44 @@
+04:26:39.415 INFO:     Using config file run/config-5821.yml
+04:26:39.422 INFO:     The 'config.yml' file cannot be found
+04:26:40.920 INFO:     Sampler preset "qwen38": temperature 0.7, top_k 20, top_p
+                       0.95, min_p 0.05, presence_penalty 1.0, max_tokens 16384
+04:26:40.922 INFO:     exllamav3 version: 1.5.1
+04:26:41.673 INFO:     The provided model has vision capabilities, vision is
+                       disabled in config.
+04:26:41.677 INFO:     Using draft model:
+                       /home/alex/code/exl3/models/own-DFlash2-EXL3-5.0bpw
+04:26:41.892 INFO:     Disabling GPU split because one GPU is in use.
+04:26:41.895 INFO:     Context: max_seq_len 114,688 tokens (configured),
+                       cache_size 114,688 tokens
+04:26:41.922 INFO:     Using template "chat_template" for chat completions.
+04:26:41.922 INFO:     Response parsing: tool format qwen3_coder (config),
+                       reasoning tags <think> </think> (config)
+04:26:42.883 INFO:     Loading model
+                       /home/alex/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.
+                       00bpw (manual GPU split)
+Loading draft modules ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 8/8   0:00:00
+Loading model modules ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 67/67 0:00:00
+ -- kvpool [1449975]: created /dev/shm/xtx-kv-test.kv.da7cd59c9279.pool: 826 slots x 9.9 MiB, 0 valid
+ -- kvpool [1449975]: created /dev/shm/xtx-kv-test.rc.18d3e197bc53.pool: 27 slots x 147.8 MiB, 0 valid
+04:26:47.514 INFO:     Model loaded in 5.6 s
+
+04:26:47.514 WARNING:  Disabling authentication makes your instance vulnerable.
+                       Set the `disable_auth` flag to False in config.yml if you
+                       want to share this instance with others.
+04:26:47.515 WARNING:  With authentication disabled and `allowed_origins` left
+                       at ["*"], any website open in a browser on this machine
+                       can send requests to this instance and read the
+                       responses, including admin endpoints. Set
+                       `network.allowed_origins` to your own frontends (or [])
+                       unless you use a browser-based frontend that needs it.
+04:26:47.516 INFO:     Serving OAI API on http://127.0.0.1:5821 (docs at
+                       http://127.0.0.1:5821/redoc)
+04:26:50.774 INFO:     #2 chat/completions: 113,115 prompt tokens ·
+                       presence_penalty: 1.0 (preset), top_k: 20 (req), top_p:
+                       0.95 (req), min_p: 0.05 (req), max_tokens: 1024 (req)
+04:28:57.621 INFO:     #2 chat/completions: 264 tokens generated at 76.2 T/s ·
+                       prompt 113,115 tokens, none cached, 113,115 new in 123.4
+                       s (917 T/s) · first token 123.4 s, total 126.8 s · draft
+                       215/343 accepted (63%)
+04:28:57.820 WARNING:  Shutdown signal called. Exiting gracefully.
+04:28:58.430 INFO:     Model unloaded.

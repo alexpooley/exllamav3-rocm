@@ -1,0 +1,24 @@
+tree /home/alex/code/exl3/wt-q27serve 0e35e66 env: EXL3_EXPANDABLE_SEGMENTS=0 EXL3_NOGRAPH=mlp,gdn EXL3_TREE=/home/alex/code/exl3/wt-q27serve 
+loaded exllamav3 from /home/alex/code/exl3/wt-q27serve/exllamav3
+ -- Loading /home/alex/code/exl3/models/own-DFlash2-EXL3-5.0bpw
+
+ -- Loading /home/alex/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw
+
+ -- Warming up...
+
+ -- Loading tokenizer...
+fixed-7    code    180.8 tok/s  tokens/round 5.82  ms/round  32.18
+fixed-7    prose    82.5 tok/s  tokens/round 2.59  ms/round  31.35
+fixed-7    reason  179.8 tok/s  tokens/round 5.63  ms/round  31.29
+fixed-7    code    186.8 tok/s  tokens/round 5.82  ms/round  31.14
+fixed-7    prose    82.5 tok/s  tokens/round 2.59  ms/round  31.35
+fixed-7    reason  179.9 tok/s  tokens/round 5.63  ms/round  31.28
+fixed-7    ALL     129.7 tok/s  tokens/round 4.07  ms/round  31.41
+adapt-7    code    186.7 tok/s  tokens/round 5.82  ms/round  31.16
+adapt-7    prose    82.4 tok/s  tokens/round 2.59  ms/round  31.37
+adapt-7    reason  179.8 tok/s  tokens/round 5.63  ms/round  31.30
+adapt-7    code    186.8 tok/s  tokens/round 5.82  ms/round  31.15
+adapt-7    prose    82.4 tok/s  tokens/round 2.59  ms/round  31.37
+adapt-7    reason  179.8 tok/s  tokens/round 5.63  ms/round  31.30
+adapt-7    ALL     130.2 tok/s  tokens/round 4.07  ms/round  31.30
+exit 0

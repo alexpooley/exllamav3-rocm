@@ -1,0 +1,7 @@
+04:26:39 prod-needle tree /home/alex/code/exl3/phoenixhaxor_exllamav3-rocm b001056 env: EXL3_EXPANDABLE_SEGMENTS=0 EXL3_KVPOOL=/dev/shm/xtx-kv-test EXL3_KVPOOL_GB=8 EXL3_NOGRAPH=mlp,gdn EXL3_RCPOOL_GB=4 
+04:26:49 loaded
+vram_after_load_mb 
+vram_peak_mb  of 
+04:28:57 speed done
+rss_gb 10.2
+04:28:59 DONE

@@ -1,0 +1,7 @@
+03:34:57 prod tree /home/alex/code/exl3/phoenixhaxor_exllamav3-rocm b001056 env: EXL3_EXPANDABLE_SEGMENTS=0 EXL3_KVPOOL=/dev/shm/xtx-kv-test EXL3_KVPOOL_GB=8 EXL3_NOGRAPH=mlp,gdn EXL3_RCPOOL_GB=4 
+03:35:07 loaded
+vram_after_load_mb 
+03:38:57 speed done
+03:38:57 eval done
+rss_gb 0.0
+03:38:59 DONE

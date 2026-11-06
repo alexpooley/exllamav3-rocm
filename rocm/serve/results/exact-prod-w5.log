@@ -1,0 +1,15 @@
+tree /home/alex/code/exl3/phoenixhaxor_exllamav3-rocm b001056 env: EXL3_EXPANDABLE_SEGMENTS=0 EXL3_NOGRAPH=mlp,gdn EXL3_TREE=/home/alex/code/exl3/phoenixhaxor_exllamav3-rocm 
+loaded exllamav3 from /home/alex/code/exl3/phoenixhaxor_exllamav3-rocm/exllamav3
+ -- Loading /home/alex/code/exl3/models/own-DFlash2-EXL3-5.0bpw
+
+ -- Loading /home/alex/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw
+
+ -- Warming up...
+
+ -- Loading tokenizer...
+window 5 adaptive True
+code   prompt 50 new 512 accepted 377  115.3 tok/s wall   4.7s
+prose  prompt 48 new 512 accepted 309   81.6 tok/s wall   6.4s
+switches: early_accept None predraft None early_accept_rounds None predraft_discarded None
+dumped /home/alex/code/exl3/serve-ab/exact-prod-w5.json
+exit 0

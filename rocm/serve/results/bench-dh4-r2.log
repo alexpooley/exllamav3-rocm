@@ -1,0 +1,24 @@
+tree /home/alex/code/exl3/wt-q27serve 0e35e66 env: EXL3_DRAFT_HEAD=/home/alex/code/exl3/models/work-dh4/lm_head-4bpw.safetensors EXL3_EXPANDABLE_SEGMENTS=0 EXL3_NOGRAPH=mlp,gdn EXL3_TREE=/home/alex/code/exl3/wt-q27serve 
+loaded exllamav3 from /home/alex/code/exl3/wt-q27serve/exllamav3
+ -- Loading /home/alex/code/exl3/models/own-DFlash2-EXL3-5.0bpw
+
+ -- Loading /home/alex/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw
+
+ -- Warming up...
+
+ -- Loading tokenizer...
+fixed-7    code    168.6 tok/s  tokens/round 5.82  ms/round  34.50
+fixed-7    prose    83.4 tok/s  tokens/round 2.57  ms/round  30.86
+fixed-7    reason  180.7 tok/s  tokens/round 5.57  ms/round  30.80
+fixed-7    code    189.9 tok/s  tokens/round 5.82  ms/round  30.64
+fixed-7    prose    83.3 tok/s  tokens/round 2.57  ms/round  30.87
+fixed-7    reason  180.7 tok/s  tokens/round 5.57  ms/round  30.81
+fixed-7    ALL     129.7 tok/s  tokens/round 4.05  ms/round  31.25
+adapt-7    code    189.8 tok/s  tokens/round 5.82  ms/round  30.66
+adapt-7    prose    83.3 tok/s  tokens/round 2.57  ms/round  30.87
+adapt-7    reason  180.7 tok/s  tokens/round 5.57  ms/round  30.80
+adapt-7    code    189.8 tok/s  tokens/round 5.82  ms/round  30.65
+adapt-7    prose    83.3 tok/s  tokens/round 2.57  ms/round  30.87
+adapt-7    reason  180.6 tok/s  tokens/round 5.57  ms/round  30.81
+adapt-7    ALL     131.6 tok/s  tokens/round 4.05  ms/round  30.81
+exit 0

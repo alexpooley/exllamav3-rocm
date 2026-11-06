@@ -1,0 +1,18 @@
+tree /home/alex/code/exl3/wt-q27serve 0e35e66 env: EXL3_EXPANDABLE_SEGMENTS=0 EXL3_NOGRAPH=mlp,gdn EXL3_TREE=/home/alex/code/exl3/wt-q27serve 
+loaded exllamav3 from /home/alex/code/exl3/wt-q27serve/exllamav3
+ -- Loading /home/alex/code/exl3/models/own-DFlash2-EXL3-5.0bpw
+
+ -- Loading /home/alex/code/exl3/models/turboderp-Qwen3.8-27B-exl3-4.00bpw
+
+ -- Warming up...
+
+ -- Loading tokenizer...
+window 7 adaptive True
+code   prompt 50 new 512 accepted 393  137.0 tok/s wall   4.0s
+prose  prompt 48 new 512 accepted 310   83.0 tok/s wall   6.3s
+json   prompt 319 new 512 accepted 446  254.0 tok/s wall   2.5s
+long   prompt 30300 new 512 accepted 405  129.6 tok/s wall  27.6s
+batch-2 pair done
+switches: early_accept True predraft True early_accept_rounds 672 predraft_discarded 0
+dumped /home/alex/code/exl3/serve-ab/exact-servem.json
+exit 0

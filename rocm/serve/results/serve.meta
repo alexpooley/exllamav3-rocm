@@ -1,0 +1,7 @@
+03:38:59 serve tree /home/alex/code/exl3/wt-q27serve c410eeb env: EXL3_EXPANDABLE_SEGMENTS=0 EXL3_KVPOOL=/dev/shm/xtx-kv-test EXL3_KVPOOL_GB=8 EXL3_NOGRAPH=mlp,gdn EXL3_RCPOOL_GB=4 
+03:39:09 loaded
+vram_after_load_mb 
+03:42:50 speed done
+04:19:42 eval done
+rss_gb 0.0
+04:19:46 DONE

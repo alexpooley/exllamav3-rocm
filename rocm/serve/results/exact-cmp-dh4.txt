@@ -1,0 +1,7 @@
+code     len 512/512 identical=yes first_diff=None
+prose    len 512/512 identical=no first_diff=308
+json     len 512/512 identical=yes first_diff=None
+long     len 512/512 identical=yes first_diff=None
+b2_code  len 512/512 identical=yes first_diff=None
+b2_json  len 512/512 identical=yes first_diff=None
+DIFF
