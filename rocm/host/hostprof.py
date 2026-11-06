@@ -7,6 +7,8 @@ sys.path.insert(0, os.path.join(os.environ.get("EXL3_TREE", os.path.expanduser("
 
 EV = []
 ON = [False]
+GEV = []          # (label, cuda event) recorded at selected launch points (--events)
+GLAB = set()
 ns = time.perf_counter_ns
 
 def wrap(obj, name, label):
@@ -15,7 +17,11 @@ def wrap(obj, name, label):
     def g(*a, **k):
         if not ON[0]: return f(*a, **k)
         EV.append((label + "<", ns()))
+        if label + "<" in GLAB:
+            e = torch.cuda.Event(enable_timing=True); e.record(); GEV.append((label + "<", e))
         r = f(*a, **k)
+        if label + ">" in GLAB:
+            e = torch.cuda.Event(enable_timing=True); e.record(); GEV.append((label + ">", e))
         EV.append((label + ">", ns()))
         return r
     setattr(obj, name, g)
@@ -30,6 +36,7 @@ def main():
     model_init.add_args(p, cache=True, add_draft_model_args=True)
     p.add_argument("--window", type=int, default=7); p.add_argument("--tokens", type=int, default=512)
     p.add_argument("--adapt", action="store_true"); p.add_argument("--dump", default=None)
+    p.add_argument("--events", action="store_true")
     p.add_argument("--bsz", type=int, default=1); p.add_argument("--noprof", action="store_true")
     args = p.parse_args()
     with torch.inference_mode():
@@ -45,6 +52,9 @@ def main():
             wrap(jobmod.Job, "receive_sample", "rsamp")
             wrap(jobmod.Job, "presample_window", "presamp")
             wrap(gdn.GDNState, "rewind", "rewind")
+            from exllamav3.modules.embedding import Embedding
+            wrap(Embedding, "forward", "emb")
+            if args.events: GLAB.update({"SSYNC<", "tfwd<", "emb>", "SYNC<", "rewind<", "kvupd<"})
             wrap(torch.cuda, "synchronize", "SYNC")
             wrap(torch.cuda.Stream, "synchronize", "SSYNC")
             wrap(torch.Tensor, "item", "ITEM")
@@ -61,6 +71,7 @@ def main():
             gen.adaptive_window = None
         dump = {}
         rounds_all = []
+        global GROUNDS; GROUNDS = []
         tot = [0, 0, 0]
         for pas in range(2):
             plist = list(prompts.values())
@@ -73,12 +84,20 @@ def main():
                 res = {}; toks = collections.defaultdict(list)
                 ON[0] = pas == 1 and not args.noprof
                 while gen.num_remaining_jobs():
-                    EV.clear()
+                    EV.clear(); GEV.clear()
                     for r in gen.iterate():
                         if r.get("stage") == "error": raise r["error"]
                         if r.get("token_ids") is not None: toks[r["identifier"]] += r["token_ids"].view(-1).tolist()
                         if r.get("eos"): res[r["identifier"]] = r
                     if ON[0] and EV: rounds_all.append(list(EV))
+                    if ON[0] and GEV:
+                        GEV[-1][1].synchronize()
+                        g = {}; seen_t = False
+                        for l, e in GEV:
+                            if l == "tfwd<": seen_t = True
+                            if l == "emb>" and not seen_t: continue
+                            g.setdefault(l, e)
+                        GROUNDS.append(g)
                 ON[0] = False
                 r = res[0]
                 n = r["new_tokens"]; t = r["time_generate"]; acc = r.get("accepted_draft_tokens")
@@ -117,6 +136,14 @@ def main():
                     if base in ("SYNC", "SSYNC", "ITEM", "CPU"): blocked[base].append(d)
             for b in ("SYNC", "SSYNC", "ITEM", "CPU", "rsamp", "rewind"):
                 cnt[b] += seen[b + "<"]
+        def gap(a, b):
+            v = [g[a].elapsed_time(g[b]) * 1e3 for g in GROUNDS if a in g and b in g]
+            v = [x for x in v if x >= 0]
+            return f"med {statistics.median(v):8.1f} us mean {statistics.mean(v):8.1f} n={len(v)}" if v else "n/a"
+        if GROUNDS:
+            print("GPU event gaps (GPU time between the two points; idle when the GPU had drained):")
+            for a, b in (("SSYNC<", "tfwd<"), ("SSYNC<", "emb>"), ("SYNC<", "rewind<"), ("SYNC<", "kvupd<")):
+                print(f"  {a:7s} -> {b:8s} {gap(a, b)}")
         print(f"rounds profiled {good}")
         print("mean count per round:", {k: round(v / good, 2) for k, v in cnt.items()})
         print("per-call duration us (median, mean, count/round):")
