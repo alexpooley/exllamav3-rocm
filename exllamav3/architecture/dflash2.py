@@ -290,6 +290,15 @@ class DFlash2Model(Model):
             y = lm.forward(x, {}, out_dtype = torch.float)
             w[:, i : i + n] = y[0].index_select(1, ids).t().half()
             del x, y
+        qdq = int(os.environ.get("EXL3_SDH_QDQ", "0") or 0)
+        if qdq:
+            # Experiment: quantise-dequantise the rows (symmetric, groups of 128 along hidden) to see what
+            # a low-bit drafter head would cost in acceptance; timing is still the fp16 path's
+            qmax = 2 ** (qdq - 1) - 1
+            for r in range(0, w.shape[0], 8192):
+                g = w[r : r + 8192].view(-1, w.shape[1] // 128, 128).float()
+                s = g.abs().amax(-1, keepdim = True).clamp_min(1e-8) / qmax
+                w[r : r + 8192] = ((g / s).round().clamp(-qmax - 1, qmax) * s).half().view(-1, w.shape[1])
         self.sdh_weight = w
         self.sdh_cols = ids
         torch.cuda.empty_cache()
