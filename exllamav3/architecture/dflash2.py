@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import weakref
+import os
 
 from ..cache import Cache
 from ..model.config import no_default
@@ -216,6 +217,12 @@ class DFlash2Model(Model):
 
         self.attached_model = None
 
+        # Own drafter head (EXL3_DRAFT_HEAD=path): a lower-bit EXL3 copy of the target's lm_head
+        # (rocm/dh4/make_head.py), used for the draft block's logits only. Verification keeps the
+        # target's head, so the output is unchanged; only the proposals (tokens per round) can differ
+        self.draft_head_path = os.environ.get("EXL3_DRAFT_HEAD") or None
+        self.draft_head = None
+
         self.draft_verifier_params.update({
             "export_state_layers": set(config.target_layer_ids),
         })
@@ -257,6 +264,26 @@ class DFlash2Model(Model):
         dflash_update_kv_from_target(self, target_hidden, cache, params, lengths)
 
 
+    @torch.inference_mode()
+    def _load_draft_head(self, lm):
+        """EXL3 tensors lm_head.{suh,svh,trellis,mul1|mcg} from a safetensors file, as a LinearEXL3 on
+        the target head's device. Same shape as the target head; only the bitrate differs"""
+        from safetensors.torch import load_file
+        from ..modules.quant.exl3 import LinearEXL3
+        assert lm.softcap == 0.0 and lm.pre_scale == 1.0 and lm.post_scale == 1.0 and not lm.trim_padded_out, \
+            "draft head needs a plain linear target head"
+        t = load_file(self.draft_head_path, device = "cpu")
+        dev = lm.device
+        g = lambda k: t.get("lm_head." + k)
+        head = LinearEXL3(
+            lm.config, lm.in_features, lm.out_features, None, None, None,
+            g("suh").to(dev), g("svh").to(dev), g("trellis").to(dev), g("mcg"), g("mul1"),
+            None, lm.out_dtype, key = "dflash2.draft_head",
+        )
+        assert head.trellis.shape[:2] == lm.inner.trellis.shape[:2], "draft head shape differs from the target head"
+        return head
+
+
     def sample_from_state(
         self,
         state: torch.Tensor,
@@ -269,8 +296,11 @@ class DFlash2Model(Model):
         target verifier still samples normally and accepts only exact matches."""
         target = self.attached_model()
         lm = target.modules[target.logit_layer_idx]
+        if self.draft_head_path and self.draft_head is None:
+            self.draft_head = self._load_draft_head(lm)
+        head = self.draft_head or lm
         logits = lm.prepare_for_device(state.half(), params)
-        logits = lm.forward(logits, params)
+        logits = head.forward(logits, params)
 
         dev = self.selector.device
         # The generator stages the block ids in pinned memory: upload without a host sync
